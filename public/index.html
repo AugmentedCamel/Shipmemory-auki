@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShipMemory Bridge</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .qr-modal { transition: opacity 0.15s; }
+    .qr-modal.hidden { opacity: 0; pointer-events: none; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <!-- QR Zoom Modal -->
+  <div id="qr-modal" class="qr-modal hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80" onclick="closeModal(event)">
+    <div class="relative bg-gray-900 rounded-lg p-6 max-w-lg w-full mx-4" onclick="event.stopPropagation()">
+      <button onclick="closeModal()" class="absolute top-3 right-3 text-gray-400 hover:text-white text-xl">&times;</button>
+      <img id="modal-qr-img" class="mx-auto rounded" alt="QR Code">
+      <p id="modal-qr-url" class="text-xs text-gray-500 font-mono text-center mt-3 break-all"></p>
+      <div class="flex gap-2 mt-4 justify-center">
+        <button id="modal-download" class="px-4 py-2 bg-blue-600 rounded text-sm hover:bg-blue-500">Download PNG</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app" class="max-w-2xl mx-auto p-6">
+    <!-- Login -->
+    <div id="login-view">
+      <h1 class="text-2xl font-bold mb-6">ShipMemory Bridge</h1>
+      <form id="login-form" class="space-y-4">
+        <input id="api-key" type="text" placeholder="API Key" class="w-full p-3 bg-gray-800 rounded border border-gray-700" required>
+        <button type="submit" class="w-full p-3 bg-blue-600 rounded font-medium hover:bg-blue-500">Connect</button>
+        <p id="login-error" class="text-red-400 text-sm hidden"></p>
+      </form>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dashboard-view" class="hidden">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold">Dashboard</h1>
+        <button id="logout-btn" class="text-sm text-gray-400 hover:text-white">Disconnect</button>
+      </div>
+
+      <!-- Deploy new card -->
+      <details class="mb-8 bg-gray-900 rounded border border-gray-700">
+        <summary class="p-4 cursor-pointer font-semibold">Deploy New Card</summary>
+        <div class="px-4 pb-4">
+          <form id="deploy-form" class="space-y-3">
+            <input id="card-id" type="text" placeholder="Card ID (url-safe, e.g. my-machine)" pattern="^[a-zA-Z0-9_-]+$" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm" required>
+            <textarea id="card-body" rows="5" placeholder="Body — the context prompt for the agent..." class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm" required></textarea>
+            <button type="submit" id="deploy-btn" class="w-full p-2 bg-green-600 rounded font-medium hover:bg-green-500 text-sm">Deploy</button>
+            <p id="deploy-error" class="text-red-400 text-sm hidden"></p>
+          </form>
+        </div>
+      </details>
+
+      <!-- Card list -->
+      <h2 class="text-lg font-semibold mb-3">Context Cards</h2>
+      <div id="cards-list" class="space-y-4">
+        <p class="text-gray-500">Loading...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API = window.location.origin;
+    let apiKey = localStorage.getItem('sm_api_key') || '';
+
+    function show(id) {
+      document.getElementById('login-view').classList.toggle('hidden', id !== 'login');
+      document.getElementById('dashboard-view').classList.toggle('hidden', id !== 'dashboard');
+    }
+
+    async function apiFetch(path, opts = {}) {
+      const sep = path.includes('?') ? '&' : '?';
+      const url = API + path + sep + 'key=' + encodeURIComponent(apiKey);
+      const headers = { 'Content-Type': 'application/json', ...opts.headers };
+      const resp = await fetch(url, { ...opts, headers });
+      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || resp.statusText);
+      return resp;
+    }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
+    // --- QR Modal ---
+    function closeModal(e) {
+      if (e && e.target !== e.currentTarget) return;
+      document.getElementById('qr-modal').classList.add('hidden');
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+    function openQrModal(src, url, filename) {
+      const modal = document.getElementById('qr-modal');
+      document.getElementById('modal-qr-img').src = src;
+      document.getElementById('modal-qr-url').textContent = url;
+      document.getElementById('modal-download').onclick = () => {
+        const a = document.createElement('a');
+        a.href = src;
+        a.download = filename;
+        a.click();
+      };
+      modal.classList.remove('hidden');
+    }
+
+    // --- Load cards with inline QR ---
+    async function loadCards() {
+      const el = document.getElementById('cards-list');
+      el.innerHTML = '<p class="text-gray-500">Loading...</p>';
+      try {
+        const resp = await apiFetch('/card');
+        const cards = await resp.json();
+        if (cards.length === 0) {
+          el.innerHTML = '<p class="text-gray-500">No context cards on this domain yet.</p>';
+          return;
+        }
+        el.innerHTML = '';
+        for (const c of cards) {
+          const card = document.createElement('div');
+          card.className = 'p-4 bg-gray-800 rounded border border-gray-700';
+
+          const registryKey = c._registry_key;
+          const displayName = registryKey || c._name || c._data_id;
+          const bodyPreview = c.body ? c.body.slice(0, 200) + (c.body.length > 200 ? '...' : '') : '(no body)';
+          const toolCount = c.tools ? c.tools.length : 0;
+          const resolveUrl = registryKey ? API + '/resolve/' + encodeURIComponent(registryKey) : null;
+
+          card.innerHTML = `
+            <div class="flex gap-4">
+              ${registryKey ? `
+              <div class="shrink-0 cursor-pointer qr-thumb" data-key="${esc(registryKey)}">
+                <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">Loading QR</div>
+              </div>` : `
+              <div class="shrink-0">
+                <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">No QR</div>
+              </div>`}
+              <div class="flex-1 min-w-0">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <h3 class="font-medium text-base">${esc(displayName)}</h3>
+                    ${registryKey ? `<p class="text-xs text-green-500 font-mono mb-1">/resolve/${esc(registryKey)}</p>` : ''}
+                    <p class="text-xs text-gray-500 font-mono mb-2">${esc(c._data_id)}</p>
+                  </div>
+                  <button onclick="deleteCard('${esc(c._data_id)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
+                </div>
+                <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
+                ${toolCount > 0 ? `<p class="text-xs text-gray-500">${toolCount} tool${toolCount > 1 ? 's' : ''}: ${esc(c.tools.map(t => t.name).join(', '))}</p>` : ''}
+                ${c.execute_url ? `<p class="text-xs text-gray-500 font-mono truncate mt-1">${esc(c.execute_url)}</p>` : ''}
+                ${c._error ? `<p class="text-xs text-red-400">${esc(c._error)}</p>` : ''}
+              </div>
+            </div>
+          `;
+          el.appendChild(card);
+
+          // Load QR inline
+          if (registryKey) {
+            loadQrThumb(card.querySelector('.qr-thumb'), registryKey, resolveUrl);
+          }
+        }
+      } catch (err) {
+        el.innerHTML = `<p class="text-red-400">${esc(err.message)}</p>`;
+      }
+    }
+
+    async function loadQrThumb(container, name, resolveUrl) {
+      try {
+        const url = API + '/qr/' + encodeURIComponent(name) + '?key=' + encodeURIComponent(apiKey);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('QR load failed');
+        const blob = await resp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+
+        const img = document.createElement('img');
+        img.src = blobUrl;
+        img.alt = 'QR ' + name;
+        img.className = 'w-24 h-24 rounded';
+        container.innerHTML = '';
+        container.appendChild(img);
+
+        // Click to zoom
+        container.onclick = () => openQrModal(blobUrl, resolveUrl, name + '.png');
+      } catch {
+        container.innerHTML = '<div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-red-400">No QR</div>';
+      }
+    }
+
+    // --- Delete ---
+    async function deleteCard(dataId, name) {
+      if (!confirm('Delete card "' + name + '"? This also removes its QR code and registry entry.')) return;
+      try {
+        await apiFetch('/deploy/' + encodeURIComponent(dataId), { method: 'DELETE' });
+        loadCards();
+      } catch (err) {
+        alert('Delete failed: ' + err.message);
+      }
+    }
+
+    // --- Connect ---
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('login-error');
+      errEl.classList.add('hidden');
+      apiKey = document.getElementById('api-key').value.trim();
+      try {
+        await apiFetch('/card');
+        localStorage.setItem('sm_api_key', apiKey);
+        show('dashboard');
+        loadCards();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      }
+    });
+
+    document.getElementById('logout-btn').addEventListener('click', () => {
+      apiKey = '';
+      localStorage.removeItem('sm_api_key');
+      show('login');
+    });
+
+    // --- Deploy ---
+    document.getElementById('deploy-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('deploy-error');
+      const btn = document.getElementById('deploy-btn');
+      errEl.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'Deploying...';
+
+      try {
+        const cardId = document.getElementById('card-id').value.trim();
+        const resp = await apiFetch('/deploy', {
+          method: 'POST',
+          body: JSON.stringify({
+            id: cardId,
+            body: document.getElementById('card-body').value.trim(),
+          }),
+        });
+        const data = await resp.json();
+
+        // Show QR modal immediately
+        openQrModal('data:image/png;base64,' + data.qr_base64, data.resolve_url, cardId + '.png');
+
+        // Clear form and refresh list
+        document.getElementById('card-id').value = '';
+        document.getElementById('card-body').value = '';
+        loadCards();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Deploy';
+      }
+    });
+
+    // --- Init ---
+    if (apiKey) {
+      show('dashboard');
+      loadCards();
+    } else {
+      show('login');
+    }
+  </script>
+</body>
+</html>
