@@ -1,9 +1,11 @@
 /** Raw video frame for processing. */
 export interface Frame {
-  /** RGBA or RGB pixel data */
+  /** RGBA pixel data */
   data: Uint8Array;
   width: number;
   height: number;
+  /** Optional JPEG-encoded version of this frame (for sending to Gemini) */
+  jpeg?: Buffer;
 }
 
 export interface ToolDeclaration {

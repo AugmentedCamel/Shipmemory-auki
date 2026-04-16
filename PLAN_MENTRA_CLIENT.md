@@ -349,3 +349,47 @@ ngrok http --url=<YOUR_NGROK_URL> 3000
 | 8 | **Dev: local Bun + ngrok** | Full logs in terminal, fast iteration. Standard Mentra dev workflow. |
 | 9 | **Deploy: Railway + nixpacks** | `aptPkgs = ["ffmpeg"]` in nixpacks config gives us FFmpeg without a custom Dockerfile. Fine for 1-20 concurrent sessions. |
 | 10 | **Build in separate repo, opensource** | Zero runtime deps on shipmemory monorepo. Android files are read-only porting reference. Cleaner git history, independent CI/CD, shareable with Mentra community. |
+| 11 | **Stay on Gemini Live (for now) despite audio waste** | Investigated three alternatives. Current choice is pragmatic — revisit if cost or model flexibility becomes a blocker. See "Audio architecture options" below. |
+
+## Audio architecture options (investigated 2026-04-16)
+
+Mentra has a **built-in STT pipeline** (Soniox/Azure providers) via `session.events.onTranscription()` with per-word confidence scores, speaker diarization, and language detection. This opened the question: should we bypass Gemini Live entirely?
+
+Also investigated: `AudioOutputStream.write()` was suggested as a way to stream raw PCM to glasses speakers. **This does not exist.** Mentra SDK audio output is limited to `playAudio({ audioUrl })` (file from URL) and `speak(text)` (ElevenLabs TTS). No raw PCM streaming. Confirmed via SDK types and [official docs](https://docs.mentraglass.com/app-devs/reference/managers/audio-manager).
+
+### Option 1: Gemini Live + discard audio + TTS (current plan) ✅
+
+```
+Mic → onAudioChunk (PCM 16kHz) → Gemini Live WebSocket
+  → Gemini generates audio (discarded) + outputAudioTranscription
+  → session.audio.speak(text) → ElevenLabs TTS → glasses speakers
+```
+
+**Pros:** Lowest latency (single hop). Built-in turn-taking, barge-in, VAD. Least code.
+**Cons:** Wastes audio generation tokens. Locked to Gemini Live models (`gemini-3.1-flash-live-preview`). Can't use Claude/GPT/etc.
+
+### Option 2: Mentra STT + generateContent API
+
+```
+Mic → Mentra cloud STT (Soniox/Azure) → TranscriptionData.text
+  + Camera frames (JPEG) as inlineData
+  → Gemini generateContent (text+image in → text out)
+  → session.audio.speak(text) → ElevenLabs TTS → glasses speakers
+```
+
+**Pros:** No wasted audio tokens. Any multimodal model (Gemini, Claude, GPT). STT confidence scores. Vision works (text+image → text supported by `gemini-3-flash-preview` and others).
+**Cons:** Higher latency (3 hops: STT → model → TTS). Must build turn management manually (VAD + conversation history). More code.
+
+**Switch when:** Need model flexibility, need STT confidence scores, or audio waste becomes a cost problem.
+
+### Option 3: Wait for Mentra `pushAudioChunk()` (future)
+
+```
+Mic → Gemini Live → Gemini audio response
+  → pushAudioChunk() → glasses speakers (native Gemini voice)
+```
+
+**Pros:** Zero waste. Native Gemini voice quality. No ElevenLabs dependency.
+**Cons:** Requires Mentra to ship `pushAudioChunk()` or equivalent raw PCM output API. Not on their public roadmap.
+
+**Switch when:** Mentra adds raw audio output to the SDK.

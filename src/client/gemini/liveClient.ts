@@ -41,6 +41,9 @@ export class GeminiLiveClient {
   private audioStreamEndTimer: ReturnType<typeof setTimeout> | null = null;
   private audioStreamActive = false;
 
+  /** Optional callback that returns the latest JPEG frame + its capture time + frame number. */
+  latestFrameProvider: (() => { jpeg: Buffer | null; capturedAt: number; frameNum: number }) | null = null;
+
   constructor(
     private apiKey: string,
     private callbacks: GeminiLiveCallbacks = {},
@@ -193,10 +196,17 @@ export class GeminiLiveClient {
       this.lastAudioLogTime = now;
     }
 
-    // Mark audio stream as active
+    // Mark audio stream as active — send a fresh frame at speech start
     if (!this.audioStreamActive) {
       this.audioStreamActive = true;
-      console.log('[Gemini:audio] Audio stream started');
+      const latest = this.latestFrameProvider?.();
+      if (latest?.jpeg) {
+        const ageMs = Date.now() - latest.capturedAt;
+        console.log(`[Gemini:audio] Speech start — sending frame #${latest.frameNum} (age: ${ageMs}ms, ${(latest.jpeg.length / 1024).toFixed(1)}KB)`);
+        this.sendVideoFrame(latest.jpeg);
+      } else {
+        console.log('[Gemini:audio] Speech start — no frame available');
+      }
     }
     this.lastAudioSendTime = now;
 
@@ -218,6 +228,16 @@ export class GeminiLiveClient {
   private sendAudioStreamEnd(): void {
     if (!this.ready || !this.ws || !this.audioStreamActive) return;
     this.audioStreamActive = false;
+
+    // Send the latest frame right before audioStreamEnd so Gemini
+    // includes it in the current turn's processing.
+    const latest = this.latestFrameProvider?.();
+    if (latest?.jpeg) {
+      const ageMs = Date.now() - latest.capturedAt;
+      console.log(`[Gemini:audio] Sending frame #${latest.frameNum} before audioStreamEnd — age: ${ageMs}ms, size: ${(latest.jpeg.length / 1024).toFixed(1)}KB`);
+      this.sendVideoFrame(latest.jpeg);
+    }
+
     console.log('[Gemini:audio] Sending audioStreamEnd (silence detected)');
     this.ws.send(JSON.stringify({
       realtimeInput: {
@@ -226,9 +246,15 @@ export class GeminiLiveClient {
     }));
   }
 
+  private videoFramesSent = 0;
+
   /** Send a JPEG video frame to Gemini. */
   sendVideoFrame(jpeg: Buffer): void {
     if (!this.ready || !this.ws) return;
+    this.videoFramesSent++;
+    if (this.videoFramesSent <= 3 || this.videoFramesSent % 10 === 0) {
+      console.log(`[Gemini:video] Sending frame #${this.videoFramesSent} (${(jpeg.length / 1024).toFixed(1)}KB, ${jpegToBase64(jpeg).length} b64 chars)`);
+    }
     this.ws.send(JSON.stringify({
       realtimeInput: {
         video: {
