@@ -14,4 +14,6 @@ export const env = {
   BRIDGE_BASE_URL: process.env.BRIDGE_BASE_URL ?? null,
   /** API key for the ShipMemory bridge (optional) */
   BRIDGE_API_KEY: process.env.BRIDGE_API_KEY ?? null,
+  /** Hardcoded resolve URL — skips QR scanning, fetches card directly (e.g. https://bridge.example/resolve/my-card) */
+  CONTEXT_CARD_URL: process.env.CONTEXT_CARD_URL ?? null,
 } as const;

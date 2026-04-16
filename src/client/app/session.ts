@@ -8,7 +8,7 @@ import { subscribeMic } from '../mentra/mic.js';
 import { speak, showText } from '../mentra/display.js';
 import { startLivestream, stopLivestream } from '../mentra/camera.js';
 import { ShipMemoryService } from '../shipmemory/service.js';
-import { MockShipMemoryService } from '../shipmemory/mock.js';
+import { MockShipMemoryService, HardcodedUrlProvider } from '../shipmemory/mock.js';
 import type { ContextCard, ContextProvider } from '../shipmemory/types.js';
 import type { env as Env } from '../config/env.js';
 import { streamState } from '../index.js';
@@ -46,9 +46,14 @@ export class SessionOrchestrator {
     this.frameSampler = new FrameSampler('scanning');
     this.whepClient = new WeriftWhepClient(640, 480, 1); // 1fps JPEG output from FFmpeg
 
-    // TODO: Switch to ShipMemoryService once camera stream is wired
-    // For now, always use mock to test the Gemini voice loop
-    this.contextProvider = new MockShipMemoryService();
+    // Pick context provider based on config:
+    // 1. CONTEXT_CARD_URL set → fetch card directly from that URL (no QR needed)
+    // 2. Otherwise → mock card for testing the voice loop
+    if (config.CONTEXT_CARD_URL) {
+      this.contextProvider = new HardcodedUrlProvider(config.CONTEXT_CARD_URL, config.BRIDGE_API_KEY);
+    } else {
+      this.contextProvider = new MockShipMemoryService();
+    }
   }
 
   /** Stream URL for frame extraction (set after camera starts) */
