@@ -313,13 +313,24 @@ export class SessionOrchestrator {
     this.state = newState;
   }
 
-  destroy(): void {
-    console.log('[Session] Destroying orchestrator — cleaning up Gemini + WHEP + camera');
+  destroy(reason: string): void {
+    console.log(`[Session] Destroying orchestrator (trigger: ${reason}) — cleaning up`);
     this.transition(AppState.IDLE);
-    this.gemini.disconnect();
-    this.whepClient.stop();
-    this.frameRelay?.stop();
-    this.clearPendingTranscription();
-    stopLivestream(this.session).catch(() => {});
+
+    safely('gemini.disconnect',   () => this.gemini.disconnect());
+    safely('whep.stop',           () => this.whepClient.stop());
+    safely('relay.stop',          () => this.frameRelay?.stop());
+    safely('clearTranscription',  () => this.clearPendingTranscription());
+    stopLivestream(this.session).catch((e) =>
+      console.warn(`[Session] stopLivestream failed: ${e instanceof Error ? e.message : e}`),
+    );
+  }
+}
+
+function safely(name: string, fn: () => void): void {
+  try {
+    fn();
+  } catch (e) {
+    console.warn(`[Session] cleanup ${name} threw: ${e instanceof Error ? e.message : e}`);
   }
 }

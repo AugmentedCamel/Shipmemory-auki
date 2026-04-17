@@ -76,7 +76,7 @@ class ShipMemoryApp extends AppServer {
     // Clean up Gemini WebSocket when Mentra session disconnects
     session.events.onDisconnected((data) => {
       console.log(`[ShipMemory] Session disconnected: ${sessionId}`, data);
-      this.cleanupSession(sessionId);
+      this.cleanupSession(sessionId, 'onDisconnected');
     });
 
     await orchestrator.start();
@@ -84,13 +84,13 @@ class ShipMemoryApp extends AppServer {
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
     console.log(`[ShipMemory] Session stop requested: ${sessionId} reason: ${reason}`);
-    this.cleanupSession(sessionId);
+    this.cleanupSession(sessionId, `onStop:${reason}`);
   }
 
-  private cleanupSession(sessionId: string): void {
+  private cleanupSession(sessionId: string, trigger: string): void {
     const orchestrator = this.orchestrators.get(sessionId);
     if (orchestrator) {
-      orchestrator.destroy();
+      orchestrator.destroy(trigger);
       this.orchestrators.delete(sessionId);
     }
     streamState.hlsUrl = null;
