@@ -20,6 +20,29 @@ export interface LivestreamUrls {
  * preview iframe are usable.
  */
 export async function startLivestream(session: AppSession): Promise<LivestreamUrls> {
+  console.log('[Mentra:camera] Starting managed livestream with WebRTC…');
+  try {
+    const result = await attemptStart(session);
+    console.log('[Mentra:camera] Stream active:', JSON.stringify(result, null, 2));
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Only retry on timeout — other errors (auth, etc.) won't be fixed by
+    // clearing a ghost stream. A timeout means Mentra cloud didn't respond,
+    // usually because a prior session's stream is still stranded on Cloudflare.
+    if (!/timeout/i.test(msg)) throw err;
+
+    console.warn(`[Mentra:camera] Start failed (${msg}) — checking for ghost stream`);
+    await clearGhostStream(session);
+
+    console.log('[Mentra:camera] Retrying managed livestream…');
+    const result = await attemptStart(session);
+    console.log('[Mentra:camera] Stream active (after retry):', JSON.stringify(result, null, 2));
+    return result;
+  }
+}
+
+async function attemptStart(session: AppSession): Promise<LivestreamUrls> {
   const activeStatus = new Promise<void>((resolve, reject) => {
     const unsubscribe = session.camera.onManagedStreamStatus((status) => {
       console.log(`[Mentra:camera] Stream status: ${status.status}`, status.streamId ?? '');
@@ -39,16 +62,32 @@ export async function startLivestream(session: AppSession): Promise<LivestreamUr
     });
   });
 
-  console.log('[Mentra:camera] Starting managed livestream with WebRTC…');
   const result = await session.camera.startManagedStream({
     enableWebRTC: true,
     quality: '720p',
   });
 
   await activeStatus;
-
-  console.log('[Mentra:camera] Stream active:', JSON.stringify(result, null, 2));
   return result;
+}
+
+async function clearGhostStream(session: AppSession): Promise<void> {
+  try {
+    const existing = await session.camera.checkExistingStream();
+    if (!existing.hasActiveStream) {
+      console.log('[Mentra:camera] No ghost stream — ready to retry');
+      return;
+    }
+    const info = existing.streamInfo;
+    console.warn(`[Mentra:camera] Ghost stream found (id=${info?.streamId}, status=${info?.status}) — stopping`);
+    await session.camera.stopManagedStream().catch((e) => {
+      console.warn(`[Mentra:camera] Ghost stop errored (continuing): ${e instanceof Error ? e.message : e}`);
+    });
+    // Give Mentra cloud a moment to propagate the stop to Cloudflare before retry.
+    await new Promise((r) => setTimeout(r, 2000));
+  } catch (e) {
+    console.warn(`[Mentra:camera] Ghost check failed (continuing): ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 export async function stopLivestream(session: AppSession): Promise<void> {
