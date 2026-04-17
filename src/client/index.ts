@@ -73,11 +73,9 @@ class ShipMemoryApp extends AppServer {
     const orchestrator = new SessionOrchestrator(session, sessionId, env);
     this.orchestrators.set(sessionId, orchestrator);
 
-    // Clean up Gemini WebSocket when Mentra session disconnects
-    session.events.onDisconnected((data) => {
-      console.log(`[ShipMemory] Session disconnected: ${sessionId}`, data);
-      this.cleanupSession(sessionId, 'onDisconnected');
-    });
+    // Cleanup is driven by onStop only — matches the canonical Mentra app pattern.
+    // session.events.onDisconnected can fire in parallel with onStop and
+    // double-handlers made the shutdown race messier without adding safety.
 
     await orchestrator.start();
   }
