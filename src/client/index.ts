@@ -24,6 +24,56 @@ class ShipMemoryApp extends AppServer {
       port: env.PORT,
     });
     this.setupWebviewRoutes();
+    this.installSessionRequestDedupe();
+  }
+
+  /**
+   * Dedupe Mentra session_request webhooks for the same sessionId.
+   *
+   * The SDK's default `handleSessionRequest` unconditionally tears down any
+   * existing session (OWNERSHIP_RELEASE + disconnect) and creates a new one
+   * whenever a session_request arrives — even if the webhook is a duplicate
+   * (same sessionId, same WS URL) from a phone foreground, Wi-Fi handoff,
+   * etc. That churn kills the stream mid-flight and produces audible
+   * start/stop cycles on the glasses.
+   *
+   * This wrapper intercepts the call. If we already have a session for this
+   * sessionId AND the webhook is pointing at the same WS URL, we ACK 200
+   * and skip the teardown — the live session keeps running. If the URL
+   * actually changed, we fall through to the SDK's original behavior.
+   *
+   * `handleSessionRequest` is typed `private` in the SDK, but it's a normal
+   * method at runtime and `setupWebhook` invokes it via `this.` — so
+   * replacing it on the instance works.
+   */
+  private installSessionRequestDedupe(): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const self = this as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const original = (self.handleSessionRequest as (req: any, res: any) => Promise<void>).bind(self);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    self.handleSessionRequest = async (request: any, res: any): Promise<void> => {
+      const sessionId: string | undefined = request?.sessionId;
+      const newUrl: string | undefined = request?.mentraOSWebsocketUrl ?? request?.augmentOSWebsocketUrl;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const activeSessions: Map<string, any> = self.activeSessions;
+      const existing = sessionId ? activeSessions.get(sessionId) : undefined;
+
+      if (existing) {
+        const existingUrl: string | undefined = existing?.config?.mentraOSWebsocketUrl;
+        if (existingUrl && newUrl && existingUrl === newUrl) {
+          console.log(`[ShipMemory] Dedupe: ignoring duplicate session_request for ${sessionId} (same WS URL, existing session alive)`);
+          res.status(200).json({ status: 'success' });
+          return;
+        }
+        console.log(
+          `[ShipMemory] Session URL changed for ${sessionId} (existing=${existingUrl}, new=${newUrl}) — allowing SDK reconnect`,
+        );
+      }
+
+      return original(request, res);
+    };
   }
 
   private setupWebviewRoutes(): void {
