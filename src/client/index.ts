@@ -82,9 +82,12 @@ class ShipMemoryApp extends AppServer {
       console.log(`[ShipMemory] Session WebSocket disconnected: ${sessionId}`, data);
       this.cleanupSession(sessionId, 'onDisconnected');
     });
+    // onError is observational only. The SDK fires it for every internal
+    // WebSocket send failure after a drop, so using it to trigger cleanup
+    // causes a flood of redundant destroy calls. Lifecycle is handled by
+    // onStop + onDisconnected.
     session.events.onError((err) => {
-      console.error(`[ShipMemory] Session error: ${sessionId}`, err);
-      this.cleanupSession(sessionId, 'onError');
+      console.error(`[ShipMemory] Session error: ${sessionId}`, err instanceof Error ? err.message : err);
     });
 
     await orchestrator.start();
