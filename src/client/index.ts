@@ -68,17 +68,32 @@ class ShipMemoryApp extends AppServer {
 
   protected async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
     console.log(`[ShipMemory] New session: ${sessionId} user: ${userId}`);
+
+    // Preemptive replace: during Mentra switching_clouds handoff, the new
+    // session webhook can fire before the old session's onStop/onDisconnected.
+    // Destroy any leftover orchestrator synchronously so its late-firing
+    // events become no-ops under the identity guard below.
+    const existing = this.orchestrators.get(sessionId);
+    if (existing) {
+      console.warn(`[ShipMemory] Replacing existing orchestrator for ${sessionId} — likely switching_clouds`);
+      existing.destroy('replaced:switching_clouds');
+      this.orchestrators.delete(sessionId);
+    }
+
     session.layouts.showTextWall('ShipMemory starting…');
 
     const orchestrator = new SessionOrchestrator(session, sessionId, env);
     this.orchestrators.set(sessionId, orchestrator);
 
-    // Belt-and-suspenders: onStop is the primary signal per Mentra docs, but
-    // empirically it sometimes doesn't fire (e.g. when the user force-closes
-    // on glasses). onDisconnected + onError catch those cases. cleanupSession
-    // is idempotent via the orchestrator-map delete guard, so whichever fires
-    // first wins and the rest are no-ops.
+    // Identity-match guard: onDisconnected can fire LATE for an old session
+    // whose sessionId was already reused by a new orchestrator (Mentra
+    // switching_clouds). Without this check, the old session's disconnect
+    // destroys the new orchestrator mid-init.
     session.events.onDisconnected((data) => {
+      if (this.orchestrators.get(sessionId) !== orchestrator) {
+        console.log(`[ShipMemory] Ignoring stale onDisconnected for ${sessionId} — orchestrator replaced`);
+        return;
+      }
       console.log(`[ShipMemory] Session WebSocket disconnected: ${sessionId}`, data);
       this.cleanupSession(sessionId, 'onDisconnected');
     });
