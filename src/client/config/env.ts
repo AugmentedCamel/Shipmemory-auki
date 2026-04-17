@@ -16,4 +16,6 @@ export const env = {
   BRIDGE_API_KEY: process.env.BRIDGE_API_KEY ?? null,
   /** Hardcoded resolve URL — skips QR scanning, fetches card directly (e.g. https://bridge.example/resolve/my-card) */
   CONTEXT_CARD_URL: process.env.CONTEXT_CARD_URL ?? null,
+  /** Comma-separated URL prefixes allowed for QR payload / card.execute_url / card.trace_url. Defaults to BRIDGE_BASE_URL. */
+  ALLOWED_URL_PREFIXES: process.env.ALLOWED_URL_PREFIXES ?? null,
 } as const;

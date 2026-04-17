@@ -1,15 +1,21 @@
 import type { ContextCard, ToolDeclaration } from './types.js';
+import { isAllowed, allowedPrefixes } from './allowlist.js';
 
 const MAX_RESPONSE_SIZE = 100_000;
 
 /**
  * Fetch a ContextCard from a URL (the QR contained a URL, not inline data).
- * Appends ?key= if an API key is provided.
+ * Appends ?key= if an API key is provided. URL must pass the allowlist.
  */
 export async function fetchContextCard(
   url: string,
   apiKey?: string | null,
 ): Promise<ContextCard> {
+  if (!isAllowed(url)) {
+    console.warn(`[QR] Rejected URL: ${url} — not in allowlist (${allowedPrefixes().join(', ') || '<empty>'})`);
+    throw new Error(`URL not in allowlist: ${url}`);
+  }
+
   const target = new URL(url);
   if (apiKey) target.searchParams.set('key', apiKey);
 

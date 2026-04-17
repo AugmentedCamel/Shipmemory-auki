@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { RTCPeerConnection } from 'werift';
-import type { Frame } from '../shipmemory/types.js';
 
 /**
  * Server-side WHEP consumer using werift (pure TS WebRTC).
@@ -34,14 +33,13 @@ export class WeriftWhepClient {
   constructor(
     private width = 640,
     private height = 480,
-    private fps = 3,
   ) {}
 
   /**
    * Connect to a WHEP endpoint and yield JPEG frames.
    * Each frame is also available as `latestJpeg` for the preview endpoint.
    */
-  async *connect(whepUrl: string): AsyncGenerator<{ jpeg: Buffer; frame: Frame }> {
+  async *connect(whepUrl: string): AsyncGenerator<{ jpeg: Buffer }> {
     this.running = true;
     console.log(`[WHEP] Connecting to ${whepUrl}`);
 
@@ -316,7 +314,7 @@ export class WeriftWhepClient {
           console.log(`[WHEP] JPEG Frame #${this.frameCount} (${(jpeg.length / 1024).toFixed(1)}KB)`);
         }
 
-        yield { jpeg, frame: { data: new Uint8Array(0), width: this.width, height: this.height, jpeg } };
+        yield { jpeg };
       } else if (!done) {
         await new Promise<void>((r) => { resolve = r; });
       } else {

@@ -2,8 +2,8 @@ import type { AppSession } from '@mentra/sdk';
 import { AppState } from './state.js';
 import { buildSystemPrompt } from './promptTemplate.js';
 import { GeminiLiveClient, type GeminiFunctionCall } from '../gemini/liveClient.js';
-import { FrameSampler } from '../bridge/frameSampler.js';
 import { WeriftWhepClient } from '../bridge/whepClient.js';
+import { FrameRelay, jpegToFrame } from '../bridge/frameConverter.js';
 import { subscribeMic } from '../mentra/mic.js';
 import { speak, showText } from '../mentra/display.js';
 import { startLivestream, stopLivestream } from '../mentra/camera.js';
@@ -14,14 +14,16 @@ import type { env as Env } from '../config/env.js';
 import { streamState } from '../index.js';
 
 const TOOL_TIMEOUT_MS = 10_000;
+const SCAN_TIMEOUT_MS = 30_000;
+const GEMINI_FRAME_INTERVAL_MS = 1000;
 
 export class SessionOrchestrator {
   private state = AppState.IDLE;
   private gemini: GeminiLiveClient;
-  private frameSampler: FrameSampler;
   private whepClient: WeriftWhepClient;
   private contextProvider: ContextProvider;
   private card: ContextCard | null = null;
+  private frameRelay: FrameRelay | null = null;
 
   // Buffer to accumulate transcription text before speaking
   private pendingTranscription = '';
@@ -43,14 +45,16 @@ export class SessionOrchestrator {
       onError: (err) => console.error('[Gemini] Error:', err),
     });
 
-    this.frameSampler = new FrameSampler('scanning');
-    this.whepClient = new WeriftWhepClient(640, 480, 1); // 1fps JPEG output from FFmpeg
+    this.whepClient = new WeriftWhepClient(640, 480);
 
     // Pick context provider based on config:
     // 1. CONTEXT_CARD_URL set → fetch card directly from that URL (no QR needed)
-    // 2. Otherwise → mock card for testing the voice loop
+    // 2. BRIDGE_BASE_URL set → real QR scanning via camera frames
+    // 3. Otherwise → mock card for testing the voice loop
     if (config.CONTEXT_CARD_URL) {
       this.contextProvider = new HardcodedUrlProvider(config.CONTEXT_CARD_URL, config.BRIDGE_API_KEY);
+    } else if (config.BRIDGE_BASE_URL) {
+      this.contextProvider = new ShipMemoryService(config.BRIDGE_API_KEY);
     } else {
       this.contextProvider = new MockShipMemoryService();
     }
@@ -62,18 +66,26 @@ export class SessionOrchestrator {
   async start(): Promise<void> {
     console.log(`[Session] Starting orchestrator (provider: ${this.contextProvider.constructor.name})`);
 
-    // Step 1: Get context (mock for now, QR scanning later)
     this.transition(AppState.SCANNING);
     showText(this.session, 'Loading context…');
 
-    const isMock = this.contextProvider instanceof MockShipMemoryService;
+    const needsCamera = this.contextProvider instanceof ShipMemoryService;
     let card: ContextCard;
 
-    if (isMock) {
-      const emptyFrames = (async function* () {})();
-      card = await this.contextProvider.scan(emptyFrames);
+    if (needsCamera) {
+      // Camera must start FIRST so QR scanner has frames to scan
+      await this.startCameraForScanning();
+
+      this.frameRelay = new FrameRelay();
+
+      // Start unified WHEP loop in background — feeds relay during SCANNING,
+      // sends JPEGs to Gemini during SESSION. Runs until state == IDLE.
+      this.runWhepLoop().catch((err) => console.error('[Session] WHEP loop error:', err));
+
+      showText(this.session, 'Point at a QR code…');
+      card = await this.scanWithTimeout(this.frameRelay);
+      this.frameRelay.stop();
     } else {
-      // TODO: Wire camera frames for QR scanning
       const emptyFrames = (async function* () {})();
       card = await this.contextProvider.scan(emptyFrames);
     }
@@ -81,11 +93,38 @@ export class SessionOrchestrator {
     this.card = card;
     console.log(`[Session] Got context card: ${card.body.slice(0, 80)}…`);
 
-    // Step 2: Start Gemini voice session (don't wait for camera)
     await this.startGeminiSession(card);
 
-    // Step 3: Start camera in background (non-blocking — video is optional)
-    this.startCamera();
+    // For non-camera providers, start camera in background now so Gemini gets video.
+    // For camera-first path, WHEP loop is already running and will pick up SESSION mode.
+    if (!needsCamera) {
+      this.startCamera();
+    }
+  }
+
+  /** Race provider.scan() against a timeout so we don't hang forever. */
+  private async scanWithTimeout(relay: FrameRelay): Promise<ContextCard> {
+    const scanPromise = this.contextProvider.scan(relay);
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`QR scan timed out after ${SCAN_TIMEOUT_MS / 1000}s`)), SCAN_TIMEOUT_MS),
+    );
+    return Promise.race([scanPromise, timeoutPromise]);
+  }
+
+  /** Start livestream synchronously — required before QR scanning can begin. */
+  private async startCameraForScanning(): Promise<void> {
+    streamState.status = 'starting';
+    const urls = await startLivestream(this.session);
+    this.streamUrl = urls.webrtcUrl ?? null;
+    streamState.hlsUrl = urls.hlsUrl;
+    streamState.dashUrl = urls.dashUrl;
+    streamState.webrtcUrl = urls.webrtcUrl ?? null;
+    streamState.status = 'active';
+    console.log(`[Session] Camera stream ready — WebRTC: ${this.streamUrl}`);
+
+    if (!this.streamUrl) {
+      throw new Error('No WebRTC URL — cannot scan for QR codes without camera');
+    }
   }
 
   /** Start camera livestream in background — non-blocking, video is optional. */
@@ -93,16 +132,15 @@ export class SessionOrchestrator {
     try {
       streamState.status = 'starting';
       const urls = await startLivestream(this.session);
-      this.streamUrl = urls.webrtcUrl ?? null; // Use WebRTC URL for WHEP
+      this.streamUrl = urls.webrtcUrl ?? null;
       streamState.hlsUrl = urls.hlsUrl;
       streamState.dashUrl = urls.dashUrl;
       streamState.webrtcUrl = urls.webrtcUrl ?? null;
       streamState.status = 'active';
       console.log(`[Session] Camera stream ready — WebRTC: ${this.streamUrl}`);
 
-      // Start server-side WHEP frame extraction if WebRTC URL is available
       if (this.streamUrl) {
-        this.startVideoStream();
+        this.runWhepLoop().catch((err) => console.error('[Session] WHEP loop error:', err));
       } else {
         console.warn('[Session] No WebRTC URL — video frames unavailable');
       }
@@ -133,43 +171,56 @@ export class SessionOrchestrator {
       capturedAt: streamState.latestJpegTime,
       frameNum: streamState.frameCount,
     });
-
-    // Switch frame sampler to session mode (1fps for Gemini video)
-    this.frameSampler.switchMode('session');
   }
 
-  /** Consume camera via WHEP (werift) and send JPEG frames to Gemini. */
-  private async startVideoStream(): Promise<void> {
+  /**
+   * Unified WHEP consumption loop for the entire session lifetime.
+   * - SCANNING: decode JPEG→RGBA, push to frameRelay for QR scanner
+   * - SESSION:  send JPEGs to Gemini at 1fps
+   * Runs until state == IDLE.
+   */
+  private async runWhepLoop(): Promise<void> {
     if (!this.streamUrl) return;
-    console.log(`[Session] Starting WHEP video extraction from ${this.streamUrl}`);
+    console.log(`[Session] Starting WHEP loop on ${this.streamUrl}`);
 
     let frameCount = 0;
+    let scanAttempts = 0;
     let lastGeminiSend = 0;
-    const FRAME_INTERVAL_MS = 1000; // 1fps continuous to Gemini (matches Android client)
 
     try {
       for await (const { jpeg } of this.whepClient.connect(this.streamUrl)) {
-        if (this.state !== AppState.SESSION && this.state !== AppState.SCANNING) break;
+        if (this.state === AppState.IDLE) break;
 
         frameCount++;
         streamState.latestJpeg = jpeg;
         streamState.latestJpegTime = Date.now();
         streamState.frameCount = frameCount;
 
-        // Send frames to Gemini at ~1fps continuously (like Android client)
-        // so Gemini always has recent visual context when a turn is processed
-        const now = Date.now();
-        if (this.state === AppState.SESSION && (now - lastGeminiSend) >= FRAME_INTERVAL_MS) {
-          this.gemini.sendVideoFrame(jpeg);
-          lastGeminiSend = now;
+        if (this.state === AppState.SCANNING && this.frameRelay) {
+          try {
+            const frame = jpegToFrame(jpeg);
+            this.frameRelay.push(frame);
+            scanAttempts++;
+            if (scanAttempts % 30 === 0) {
+              console.log(`[Session:scan] ${scanAttempts} frames scanned, no QR yet`);
+            }
+          } catch {
+            // Partial/corrupted JPEG — skip silently
+          }
+        } else if (this.state === AppState.SESSION) {
+          const now = Date.now();
+          if ((now - lastGeminiSend) >= GEMINI_FRAME_INTERVAL_MS) {
+            this.gemini.sendVideoFrame(jpeg);
+            lastGeminiSend = now;
+          }
         }
 
         if (frameCount % 30 === 1) {
-          console.log(`[Session:video] Frame #${frameCount} captured (${(jpeg.length / 1024).toFixed(1)}KB)`);
+          console.log(`[Session:video] Frame #${frameCount} (${(jpeg.length / 1024).toFixed(1)}KB, state=${this.state})`);
         }
       }
     } catch (err) {
-      console.error('[Session] WHEP video stream error:', err);
+      console.error('[Session] WHEP loop error:', err);
     }
   }
 
@@ -264,11 +315,11 @@ export class SessionOrchestrator {
 
   destroy(): void {
     console.log('[Session] Destroying orchestrator — cleaning up Gemini + WHEP + camera');
+    this.transition(AppState.IDLE);
     this.gemini.disconnect();
     this.whepClient.stop();
-    this.frameSampler.destroy();
+    this.frameRelay?.stop();
     this.clearPendingTranscription();
     stopLivestream(this.session).catch(() => {});
-    this.transition(AppState.IDLE);
   }
 }
