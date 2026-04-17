@@ -73,9 +73,19 @@ class ShipMemoryApp extends AppServer {
     const orchestrator = new SessionOrchestrator(session, sessionId, env);
     this.orchestrators.set(sessionId, orchestrator);
 
-    // Cleanup is driven by onStop only — matches the canonical Mentra app pattern.
-    // session.events.onDisconnected can fire in parallel with onStop and
-    // double-handlers made the shutdown race messier without adding safety.
+    // Belt-and-suspenders: onStop is the primary signal per Mentra docs, but
+    // empirically it sometimes doesn't fire (e.g. when the user force-closes
+    // on glasses). onDisconnected + onError catch those cases. cleanupSession
+    // is idempotent via the orchestrator-map delete guard, so whichever fires
+    // first wins and the rest are no-ops.
+    session.events.onDisconnected((data) => {
+      console.log(`[ShipMemory] Session WebSocket disconnected: ${sessionId}`, data);
+      this.cleanupSession(sessionId, 'onDisconnected');
+    });
+    session.events.onError((err) => {
+      console.error(`[ShipMemory] Session error: ${sessionId}`, err);
+      this.cleanupSession(sessionId, 'onError');
+    });
 
     await orchestrator.start();
   }
