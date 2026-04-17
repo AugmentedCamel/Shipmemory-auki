@@ -84,6 +84,14 @@ class ShipMemoryApp extends AppServer {
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
     console.log(`[ShipMemory] Session stop requested: ${sessionId} reason: ${reason}`);
+    // Mentra bug #2526: `user_disabled` is often reported for platform-side drops
+    // where the user did nothing. Flag it so we don't waste time suspecting the user.
+    if (reason === 'user_disabled') {
+      console.warn(
+        '[ShipMemory] reason=user_disabled may be spurious — see MentraOS#2526 ' +
+        '(triggerStopByPackageName mis-reports platform drops as user action)',
+      );
+    }
     this.cleanupSession(sessionId, `onStop:${reason}`);
   }
 

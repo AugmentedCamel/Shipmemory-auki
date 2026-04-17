@@ -63,15 +63,26 @@ export class WeriftWhepClient {
     await this.pc.setLocalDescription(offer);
     console.log(`[WHEP] Created SDP offer (${offer.sdp!.length} bytes)`);
 
-    // Log the codec lines from the SDP for debugging
-    const codecLines = offer.sdp!.split('\n').filter(l => l.startsWith('a=rtpmap:'));
+    // WHEP requirement (Mentra #2521): wait for ICE gathering to complete
+    // before POSTing the offer. Skipping this causes silent failure.
+    await waitForIceGathering(this.pc, 5000);
+
+    // Use the finalized local description (now has ICE candidates)
+    const finalSdp = this.pc.localDescription?.sdp ?? offer.sdp;
+    console.log(`[WHEP] Final SDP after ICE gathering (${finalSdp!.length} bytes)`);
+
+    const codecLines = finalSdp!.split('\n').filter(l => l.startsWith('a=rtpmap:'));
     console.log(`[WHEP] SDP offer codecs: ${codecLines.map(l => l.trim()).join(', ')}`);
 
     // --- Step 2: WHEP handshake ---
+    // Mentra #2521: Accept: application/sdp is a hard requirement, not optional.
     const res = await fetch(whepUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
-      body: offer.sdp,
+      headers: {
+        'Content-Type': 'application/sdp',
+        Accept: 'application/sdp',
+      },
+      body: finalSdp,
     });
 
     if (!res.ok) {
@@ -405,4 +416,31 @@ export class WeriftWhepClient {
       this.pc = null;
     }
   }
+}
+
+/**
+ * Wait for ICE gathering to reach 'complete'. Resolves immediately if already
+ * complete. Resolves (not rejects) on timeout — partial candidates are usually
+ * enough for Cloudflare WHEP to succeed, just less optimal.
+ */
+async function waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  if (pc.iceGatheringState === 'complete') {
+    console.log('[WHEP] ICE gathering already complete');
+    return;
+  }
+  console.log(`[WHEP] Waiting for ICE gathering (state: ${pc.iceGatheringState})`);
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      console.warn(`[WHEP] ICE gathering timed out after ${timeoutMs}ms (state: ${pc.iceGatheringState}) — proceeding anyway`);
+      resolve();
+    }, timeoutMs);
+
+    pc.iceGatheringStateChange.subscribe((state) => {
+      if (state === 'complete') {
+        clearTimeout(timer);
+        console.log('[WHEP] ICE gathering complete');
+        resolve();
+      }
+    });
+  });
 }
