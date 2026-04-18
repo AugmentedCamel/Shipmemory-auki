@@ -1,18 +1,24 @@
 import type { Request, Response, NextFunction } from 'express';
-
-const API_KEY = process.env.API_KEY || '';
+import { BridgeConfig } from '../services/BridgeConfig.js';
 
 /**
- * Validates ?key= query param against the configured API_KEY.
- * If no API_KEY is set in env, all requests pass through.
+ * Validates ?key= query param against the currently configured API key.
+ *
+ * - If the bridge is unconfigured (no API key set anywhere), returns 503 with
+ *   a pointer to /ui so callers know the setup step is required.
+ * - If configured, the provided key must match exactly.
+ *
+ * Config is read per-request from BridgeConfig so changes in Settings take
+ * effect immediately — no restart required.
  */
 export function requireApiKey(req: Request, res: Response, next: NextFunction) {
-  if (!API_KEY) {
-    next();
+  const apiKey = BridgeConfig.current().apiKey;
+  if (!apiKey) {
+    res.status(503).json({ error: 'Bridge not configured', detail: 'Complete setup at /ui' });
     return;
   }
-  const key = req.query.key as string | undefined;
-  if (key !== API_KEY) {
+  const provided = req.query.key as string | undefined;
+  if (provided !== apiKey) {
     res.status(401).json({ error: 'Invalid or missing API key' });
     return;
   }

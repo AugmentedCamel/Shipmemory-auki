@@ -5,3 +5,4 @@ dist/
 .claude/
 logs.txt
 package-lock.json
+data/

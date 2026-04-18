@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { BridgeConfig } from './BridgeConfig.js';
 
 const AUKI_API_BASE = (process.env.AUKI_API_BASE_URL || 'https://api.auki.network').replace(/\/+$/, '');
 const AUKI_DDS_BASE = (process.env.AUKI_DDS_BASE_URL || 'https://dds.auki.network').replace(/\/+$/, '');
@@ -45,62 +46,124 @@ export class AukiAuthService {
 }
 
 /**
- * Server-side cached auth. The bridge logs in once with its own credentials
- * and keeps a valid domain token for all public endpoints (e.g. /resolve).
+ * Server-side cached auth. Reads credentials from BridgeConfig (env > file),
+ * logs in on demand, keeps a valid domain token, re-authenticates when the
+ * config changes, and wipes state on reset().
  */
 export class BridgeAuth {
   private static sessionToken: string | null = null;
   private static domainAuth: DomainAuth | null = null;
   private static domainId: string | null = null;
+  private static refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private static mintPromise: Promise<DomainAuth> | null = null;
+  private static subscribed = false;
 
-  static async init() {
-    const email = process.env.AUKI_EMAIL;
-    const password = process.env.AUKI_PASSWORD;
-    const domainId = process.env.AUKI_DOMAIN_ID;
-    if (!email || !password || !domainId) {
-      console.warn('WARN: AUKI_EMAIL, AUKI_PASSWORD, or AUKI_DOMAIN_ID not set — bridge auth disabled');
+  /** Called once on boot. Subscribes to config changes. No-op if unconfigured. */
+  static async init(): Promise<void> {
+    if (!this.subscribed) {
+      BridgeConfig.onChange(() => this.handleConfigChange());
+      this.subscribed = true;
+    }
+    await this.handleConfigChange();
+  }
+
+  /** Called on boot and whenever BridgeConfig changes. */
+  private static async handleConfigChange(): Promise<void> {
+    const snapshot = BridgeConfig.current();
+    const { aukiEmail, aukiPassword, aukiDomainId } = snapshot;
+
+    if (!aukiEmail || !aukiPassword || !aukiDomainId) {
+      // Unconfigured — wipe any cached auth.
+      this.reset();
+      console.log('[BridgeAuth] Auki credentials not set — waiting for setup');
       return;
     }
-    this.domainId = domainId;
-    console.log(`[BridgeAuth] Logging in as ${email}...`);
-    const { accessToken } = await AukiAuthService.login(email, password);
-    this.sessionToken = accessToken;
-    await this.refreshDomainToken();
-    console.log('[BridgeAuth] Ready');
-  }
 
-  private static async refreshDomainToken(): Promise<DomainAuth> {
-    if (!this.sessionToken || !this.domainId) throw new Error('Bridge auth not initialized');
-    // Deduplicate concurrent refreshes
-    if (this.mintPromise) return this.mintPromise;
-    this.mintPromise = (async () => {
-      const auth = await AukiAuthService.mintDomainToken(this.sessionToken!, this.domainId!);
-      this.domainAuth = auth;
-      // Schedule refresh before expiry
-      if (auth.exp) {
-        const refreshIn = Math.max(60_000, auth.exp - Date.now() - 120_000);
-        setTimeout(() => {
-          this.mintPromise = null;
-          this.refreshDomainToken().catch(err => console.error('[BridgeAuth] Refresh failed:', err.message));
-        }, refreshIn);
-      }
-      return auth;
-    })();
     try {
-      return await this.mintPromise;
-    } finally {
-      this.mintPromise = null;
+      console.log(`[BridgeAuth] Logging in as ${aukiEmail}...`);
+      const { accessToken } = await AukiAuthService.login(aukiEmail, aukiPassword);
+      this.sessionToken = accessToken;
+      this.domainId = aukiDomainId;
+      await this.refresh();
+      console.log('[BridgeAuth] Ready');
+    } catch (err: any) {
+      console.error('[BridgeAuth] Login failed:', err?.message ?? err);
+      this.reset();
+      throw err;
     }
   }
 
-  /** Get a valid domain auth for server-side reads/writes */
+  /** True iff we hold a live domain token for the current config. */
+  static isReady(): boolean {
+    const snapshot = BridgeConfig.current();
+    if (!snapshot.isConfigured) return false;
+    if (!this.domainAuth || !this.sessionToken) return false;
+    if (this.domainAuth.exp && this.domainAuth.exp - Date.now() < 10_000) return false;
+    return true;
+  }
+
+  /** Clear all cached auth state. Cancels any scheduled refresh. */
+  static reset(): void {
+    this.sessionToken = null;
+    this.domainAuth = null;
+    this.domainId = null;
+    this.mintPromise = null;
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  }
+
+  /** (Re)mint the domain token. Deduplicates concurrent callers via mintPromise. */
+  private static async refresh(): Promise<DomainAuth> {
+    if (this.mintPromise) return this.mintPromise;
+    if (!this.sessionToken || !this.domainId) {
+      throw new Error('BridgeAuth not initialized');
+    }
+
+    const sessionToken = this.sessionToken;
+    const domainId = this.domainId;
+
+    this.mintPromise = (async () => {
+      try {
+        const auth = await AukiAuthService.mintDomainToken(sessionToken, domainId);
+        // If config changed under us mid-flight, discard and bail.
+        if (this.sessionToken !== sessionToken || this.domainId !== domainId) {
+          throw new Error('Config changed during refresh — discarding stale token');
+        }
+        this.domainAuth = auth;
+        this.scheduleRefresh(auth);
+        return auth;
+      } finally {
+        this.mintPromise = null;
+      }
+    })();
+
+    return this.mintPromise;
+  }
+
+  private static scheduleRefresh(auth: DomainAuth): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+    if (!auth.exp) return;
+    const refreshIn = Math.max(60_000, auth.exp - Date.now() - 120_000);
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.refresh().catch((err) => console.error('[BridgeAuth] Refresh failed:', err.message));
+    }, refreshIn);
+  }
+
+  /** Get a valid domain auth. Refreshes if the cached one is near expiry. */
   static async getDomainAuth(): Promise<{ auth: DomainAuth; domainId: string }> {
-    if (!this.domainId) throw new Error('Bridge auth not configured (set AUKI_EMAIL, AUKI_PASSWORD, AUKI_DOMAIN_ID)');
+    if (!this.domainId || !this.sessionToken) {
+      throw new Error('Bridge auth not configured — complete setup at /ui');
+    }
     if (this.domainAuth && (!this.domainAuth.exp || this.domainAuth.exp - Date.now() > 60_000)) {
       return { auth: this.domainAuth, domainId: this.domainId };
     }
-    const auth = await this.refreshDomainToken();
+    const auth = await this.refresh();
     return { auth, domainId: this.domainId };
   }
 }

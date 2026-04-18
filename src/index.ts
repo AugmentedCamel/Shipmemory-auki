@@ -8,8 +8,11 @@ import { sessionRoutes } from './routes/session.js';
 import { qrRoutes } from './routes/qr.js';
 import { authRoutes } from './routes/auth.js';
 import { deployRoutes } from './routes/deploy.js';
+import { setupRoutes } from './routes/setup.js';
 import { uiRoutes } from './routes/ui.js';
 import { BridgeAuth } from './services/AukiAuthService.js';
+import { BridgeConfig } from './services/BridgeConfig.js';
+import { requireConfigured } from './middleware/requireConfigured.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -25,24 +28,34 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-// API routes
-app.use('/auth', authRoutes);
-app.use('/resolve', resolveRoutes);        // Public: uses ?key= and bridge's own domain token
-app.use('/card', cardRoutes);              // Authenticated: requires Authorization header
-app.use('/session', sessionRoutes);        // Authenticated: requires Authorization header
-app.use('/qr', qrRoutes);                 // Authenticated: requires Authorization header
-app.use('/deploy', deployRoutes);          // Authenticated: requires Authorization header
+// Setup endpoints — conditionally authenticated (open when unconfigured)
+app.use('/api/setup', setupRoutes);
+
+// Business endpoints — require the bridge to be fully configured + Auki-authed
+app.use('/auth', requireConfigured, authRoutes);
+app.use('/resolve', requireConfigured, resolveRoutes);
+app.use('/card', requireConfigured, cardRoutes);
+app.use('/session', requireConfigured, sessionRoutes);
+app.use('/qr', requireConfigured, qrRoutes);
+app.use('/deploy', requireConfigured, deployRoutes);
 
 // Web UI
 app.use('/', uiRoutes);
 
 async function start() {
+  await BridgeConfig.load();
+
   try {
     await BridgeAuth.init();
   } catch (err: any) {
-    console.error('[startup] Bridge auth failed:', err.message);
-    console.error('[startup] Public endpoints (/resolve) will not work until auth is configured');
+    console.error('[startup] Initial Auki login failed:', err?.message ?? err);
+    console.error('[startup] Business endpoints will return 503 until credentials are valid — visit /ui');
   }
+
+  if (!BridgeConfig.current().isConfigured) {
+    console.log('[Bridge] Unconfigured — complete setup at http://localhost:' + PORT + '/ui');
+  }
+
   app.listen(PORT, () => {
     console.log(`ShipMemory Bridge running on port ${PORT}`);
   });
