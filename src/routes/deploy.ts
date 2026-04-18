@@ -52,9 +52,11 @@ deployRoutes.post('/', requireApiKey, async (req, res) => {
     }
 
     // Strip asset_id from the card body; it's injected at resolve time.
+    const { tool_refs } = req.body;
     const card: Record<string, unknown> = {
       body,
       ...(tools ? { tools } : {}),
+      ...(Array.isArray(tool_refs) && tool_refs.length > 0 ? { tool_refs } : {}),
       ...(execute_url ? { execute_url } : {}),
     };
     const validation = ContextCardSchema.safeParse(card);
@@ -116,7 +118,7 @@ deployRoutes.put('/:asset_id', requireApiKey, async (req, res) => {
   try {
     const { auth: domainAuth, domainId } = await BridgeAuth.getDomainAuth();
     const assetId = req.params.asset_id;
-    const { body, tools, execute_url } = req.body;
+    const { body, tools, tool_refs, execute_url } = req.body;
 
     if (!body) {
       res.status(400).json({ error: 'body required' });
@@ -125,6 +127,7 @@ deployRoutes.put('/:asset_id', requireApiKey, async (req, res) => {
     const card: Record<string, unknown> = {
       body,
       ...(tools ? { tools } : {}),
+      ...(Array.isArray(tool_refs) && tool_refs.length > 0 ? { tool_refs } : {}),
       ...(execute_url ? { execute_url } : {}),
     };
     const validation = ContextCardSchema.safeParse(card);

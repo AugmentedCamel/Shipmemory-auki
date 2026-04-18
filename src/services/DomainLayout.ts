@@ -22,6 +22,7 @@ import { DomainStorageService } from './DomainStorageService.js';
  */
 
 export const REGISTRY_TYPE = 'registry';
+export const TOOL_PRESET_TYPE = 'tool_preset';
 export const NAME_CARD = 'card';
 export const NAME_QR = 'qr';
 

@@ -9,6 +9,9 @@ export const ToolSchema = z.object({
 export const ContextCardSchema = z.object({
   body: z.string().min(1),
   tools: z.array(ToolSchema).optional(),
+  // Names of tool_preset entries on the domain (e.g. "session_history").
+  // /resolve expands these into full tool definitions on the way out.
+  tool_refs: z.array(z.string()).optional(),
   execute_url: z.string().optional(),
   // Injected by /resolve at response time so clients can target the asset folder
   // for per-card tool storage (transcript, etc). Ignored on write.

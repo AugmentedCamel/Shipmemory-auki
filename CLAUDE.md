@@ -72,9 +72,18 @@ Resolve: client GETs /resolve/{key}?key=...
   → Validates, injects asset_id into response, returns ContextCard JSON
 
 Tool calls (session transcript) target the asset folder via asset_id:
-  POST /session/:asset_id/transcript   (append a turn)
-  GET  /session/:asset_id/transcript   (read turns; optional ?session_id=...)
+  POST /session/:asset_id/transcript   (append a role-based entry)
+  GET  /session/:asset_id/transcript   (read entries; optional ?session_id=...)
+
+Agent tool dispatcher (set as execute_url when a card uses built-in tools):
+  POST /tool/:asset_id                 body { tool: "session_history", params: {...} }
 ```
+
+Tool presets live on the domain under `tool_preset`. Built-in `session_history`
+is seeded on first boot; cards reference presets via `tool_refs: ["..."]` which
+/resolve expands into full tool definitions on the way out. This keeps stored
+cards small while the resolved response still looks identical to what the
+Android client expects.
 
 Legacy flat layout (`contextcard`, `qr_registry`, `qr_image`, `session:{card_id}:{data_key}`) is still readable by `/resolve`, `/card`, `/qr`, and `/inventory` for backwards compatibility, but new deploys always write the asset-folder layout.
 
@@ -102,6 +111,7 @@ Current (asset-folder):
 | Data type | Name convention | Purpose |
 |---|---|---|
 | `registry` | `{key}` | `{ asset_id, key }` — QR lookup key → asset folder |
+| `tool_preset` | `{preset_name}` | Tool definition the agent sees. Built-ins seeded on boot (`session_history`). |
 | `asset:{asset_id}` | `card` | ContextCard JSON |
 | `asset:{asset_id}` | `qr` | QR code PNG |
 | `asset:{asset_id}` | `session:{sid}:{turn}` | Transcript entry (append-only, zero-padded turn) |
