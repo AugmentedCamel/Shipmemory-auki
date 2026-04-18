@@ -11,7 +11,7 @@ import { ShipMemoryService } from '../shipmemory/service.js';
 import { MockShipMemoryService, HardcodedUrlProvider } from '../shipmemory/mock.js';
 import type { ContextCard, ContextProvider } from '../shipmemory/types.js';
 import type { env as Env } from '../config/env.js';
-import { streamState } from '../index.js';
+import { streamState, transcriptEvents } from '../index.js';
 
 const TOOL_TIMEOUT_MS = 10_000;
 const SCAN_TIMEOUT_MS = 120_000;
@@ -40,8 +40,14 @@ export class SessionOrchestrator {
   ) {
     this.gemini = new GeminiLiveClient(config.GEMINI_API_KEY, {
       onOutputTranscription: (text) => this.handleOutputTranscription(text),
-      onInputTranscription: (text) => console.log(`[User] ${text}`),
-      onTurnComplete: () => this.flushTranscription(),
+      onInputTranscription: (text) => {
+        console.log(`[User] ${text}`);
+        transcriptEvents.emit('event', { type: 'user', text });
+      },
+      onTurnComplete: () => {
+        this.flushTranscription();
+        transcriptEvents.emit('event', { type: 'turn_complete' });
+      },
       onInterrupted: () => this.clearPendingTranscription(),
       onToolCall: (calls) => this.handleToolCalls(calls),
       onToolCallCancellation: (ids) => console.log(`[Gemini] Tool calls cancelled: ${ids.join(', ')}`),
@@ -294,6 +300,7 @@ export class SessionOrchestrator {
 
   private handleOutputTranscription(text: string): void {
     this.pendingTranscription += text;
+    transcriptEvents.emit('event', { type: 'ai', text });
 
     // Debounce: flush after 300ms of no new text
     if (this.transcriptionFlushTimer) clearTimeout(this.transcriptionFlushTimer);

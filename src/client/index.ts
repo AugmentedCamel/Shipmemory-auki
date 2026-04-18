@@ -1,6 +1,17 @@
 import { AppServer, AppSession } from '@mentra/sdk';
+import { EventEmitter } from 'node:events';
 import { env } from './config/env.js';
 import { SessionOrchestrator } from './app/session.js';
+
+/**
+ * Transcript event bus for the webview SSE stream. Orchestrator pushes;
+ * /api/transcript/stream subscribers drain. Events:
+ *   { type: 'user', text }         — user transcription chunk
+ *   { type: 'ai',   text }         — Gemini output transcription chunk
+ *   { type: 'turn_complete' }      — Gemini finished its reply
+ */
+export const transcriptEvents = new EventEmitter();
+transcriptEvents.setMaxListeners(50);
 
 /** Shared stream state so the /webview route can access current URLs */
 export const streamState: {
@@ -87,6 +98,19 @@ class ShipMemoryApp extends AppServer {
         console.error(`[ShipMemory] orchestrator.start() failed for ${sessionId} — cleaning up`, err);
         this.cleanupSession(sessionId, 'start-failed');
       });
+    });
+
+    // SSE stream of Gemini transcription events (user speech + AI reply).
+    // No history — subscribers see events from the moment they connect.
+    express.get('/api/transcript/stream', (req, res) => {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      res.write('retry: 2000\n\n');
+      const listener = (ev: unknown) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+      transcriptEvents.on('event', listener);
+      req.on('close', () => transcriptEvents.off('event', listener));
     });
 
     // Latest camera frame as JPEG (for debugging)
@@ -347,7 +371,10 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
   <div id="iframe-player" style="display:none; width:100%; height:100%;">
     <iframe id="preview-iframe" style="width:100%; height:100%; border:none;" allow="autoplay"></iframe>
   </div>
-  <pre id="log" style="position:fixed; bottom:0; left:0; right:0; max-height:30vh; overflow-y:auto; background:rgba(0,0,0,0.85); color:#0f0; font-size:0.75rem; padding:8px; z-index:100;"></pre>
+  <div id="transcript" style="position:fixed; bottom:0; left:0; right:0; min-height:72px; max-height:30vh; overflow-y:auto; background:rgba(0,0,0,0.85); color:#e5e7eb; font-size:0.95rem; padding:12px 16px; z-index:40; border-top:1px solid #1f2937; line-height:1.4;">
+    <div id="user-line" style="color:#93c5fd; margin-bottom:4px;"><span style="opacity:0.6">You:</span> <span id="user-text"></span></div>
+    <div id="ai-line" style="color:#6ee7b7;"><span style="opacity:0.6">AI:</span> <span id="ai-text"></span></div>
+  </div>
 
   <script>
     const gateEl = document.getElementById('gate');
@@ -357,9 +384,10 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const statusEl = document.getElementById('status');
     const iframePlayer = document.getElementById('iframe-player');
     const previewIframe = document.getElementById('preview-iframe');
-    const logEl = document.getElementById('log');
     const modeBadgeEl = document.getElementById('mode-badge');
     const reconnectBannerEl = document.getElementById('reconnect-banner');
+    const userTextEl = document.getElementById('user-text');
+    const aiTextEl = document.getElementById('ai-text');
     let started = false;
     let streamAttached = false;
     let startPressed = false;
@@ -377,10 +405,31 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       modeBadgeEl.style.color = s.fg;
     }
 
-    function log(msg) {
-      console.log(msg);
-      logEl.textContent += msg + '\\n';
-      logEl.scrollTop = logEl.scrollHeight;
+    // --- Transcript stream: show current turn (You + AI) ---
+    let lastTranscriptRole = null;
+    function onTranscriptEvent(ev) {
+      if (ev.type === 'user') {
+        if (lastTranscriptRole === 'ai') {
+          // New user turn after an AI reply — clear both lines.
+          userTextEl.textContent = '';
+          aiTextEl.textContent = '';
+        }
+        userTextEl.textContent += ev.text;
+        lastTranscriptRole = 'user';
+      } else if (ev.type === 'ai') {
+        aiTextEl.textContent += ev.text;
+        lastTranscriptRole = 'ai';
+      }
+      // turn_complete: keep the AI reply on screen until the next user turn.
+    }
+    try {
+      const sse = new EventSource('/api/transcript/stream');
+      sse.onmessage = (e) => {
+        try { onTranscriptEvent(JSON.parse(e.data)); } catch {}
+      };
+      // EventSource auto-reconnects on error; nothing to do.
+    } catch (e) {
+      console.warn('Transcript SSE unavailable:', e);
     }
 
     async function pollGate() {
@@ -436,7 +485,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       try {
         const res = await fetch('/api/start', { method: 'POST' });
         const body = await res.json();
-        log('Start response: ' + JSON.stringify(body));
+        console.log('Start response:', body);
         if (!res.ok) {
           startPressed = false;
           startBtn.disabled = false;
@@ -455,13 +504,13 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       try {
         const res = await fetch('/api/stream');
         const data = await res.json();
-        log('Poll: status=' + data.status + ' iframe=' + !!data.iframeUrl);
+        console.log('Poll: status=' + data.status + ' iframe=' + !!data.iframeUrl);
 
         if (data.status === 'active' && data.iframeUrl) {
           if (!streamAttached || data.iframeUrl !== attachedIframeUrl) {
             streamAttached = true;
             attachedIframeUrl = data.iframeUrl;
-            log('Attaching Cloudflare preview iframe');
+            console.log('Attaching Cloudflare preview iframe');
             statusEl.style.display = 'none';
             iframePlayer.style.display = 'block';
             previewIframe.src = data.iframeUrl;
@@ -477,7 +526,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
             statusEl.style.display = 'block';
           }
         }
-      } catch (e) { log('Poll error: ' + e); }
+      } catch (e) { console.warn('Poll error:', e); }
 
       setTimeout(poll, 2000);
     }
