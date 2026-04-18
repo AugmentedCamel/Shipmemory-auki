@@ -307,8 +307,8 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     <style>
       #start-btn:disabled { opacity:0.4; cursor:not-allowed; }
     </style>
-    <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:320px; line-height:1.4;">
-      Tap Start when you're ready to scan a QR code. The camera stays off until you do — no stream restart loop.
+    <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:340px; line-height:1.45;">
+      Tap Start to begin. The camera starts, looks for a QR code for up to 30 seconds, then Gemini Live takes over for voice. The camera stays off until you tap.
     </div>
   </div>
 
@@ -356,7 +356,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
           if (startPressed) {
             gateStatusEl.textContent = 'Starting…';
           } else {
-            gateStatusEl.textContent = 'Ready. Hold the QR steady before you tap Start.';
+            gateStatusEl.textContent = 'Ready to start.';
             startBtn.style.display = 'inline-block';
             gateHintEl.style.display = 'block';
           }
