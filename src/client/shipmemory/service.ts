@@ -5,7 +5,7 @@ import { decodeSM1 } from './sm1.js';
 import { fetchContextCard, parseContextCardJSON } from './urlFetch.js';
 import { isAllowed, allowedPrefixes } from './allowlist.js';
 
-const CONSENSUS_REQUIRED = 2;
+const CONSENSUS_REQUIRED = 1;
 
 /**
  * Real ShipMemory context provider.
