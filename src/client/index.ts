@@ -303,7 +303,10 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 <body>
   <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
     <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
-    <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600;">Start</button>
+    <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600; transition:opacity 0.2s;">Start</button>
+    <style>
+      #start-btn:disabled { opacity:0.4; cursor:not-allowed; }
+    </style>
     <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:320px; line-height:1.4;">
       Tap Start when you're ready to scan a QR code. The camera stays off until you do — no stream restart loop.
     </div>
@@ -333,6 +336,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const logEl = document.getElementById('log');
     let started = false;
     let streamAttached = false;
+    let startPressed = false;
 
     function log(msg) {
       console.log(msg);
@@ -349,9 +353,13 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
           startBtn.style.display = 'none';
           gateHintEl.style.display = 'none';
         } else if (!s.started) {
-          gateStatusEl.textContent = 'Ready. Hold the QR steady before you tap Start.';
-          startBtn.style.display = 'inline-block';
-          gateHintEl.style.display = 'block';
+          if (startPressed) {
+            gateStatusEl.textContent = 'Starting…';
+          } else {
+            gateStatusEl.textContent = 'Ready. Hold the QR steady before you tap Start.';
+            startBtn.style.display = 'inline-block';
+            gateHintEl.style.display = 'block';
+          }
         } else {
           // User tapped Start — hide the gate, show the player flow
           gateEl.style.display = 'none';
@@ -369,6 +377,8 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     }
 
     startBtn.addEventListener('click', async () => {
+      if (startPressed) return;
+      startPressed = true;
       startBtn.disabled = true;
       gateStatusEl.textContent = 'Starting…';
       try {
@@ -376,10 +386,12 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         const body = await res.json();
         log('Start response: ' + JSON.stringify(body));
         if (!res.ok) {
+          startPressed = false;
           startBtn.disabled = false;
           gateStatusEl.textContent = body.error || 'Start failed';
         }
       } catch (e) {
+        startPressed = false;
         startBtn.disabled = false;
         gateStatusEl.textContent = 'Start error: ' + e;
       }
