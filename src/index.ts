@@ -8,6 +8,7 @@ import { sessionRoutes } from './routes/session.js';
 import { qrRoutes } from './routes/qr.js';
 import { authRoutes } from './routes/auth.js';
 import { deployRoutes } from './routes/deploy.js';
+import { inventoryRoutes } from './routes/inventory.js';
 import { setupRoutes } from './routes/setup.js';
 import { uiRoutes } from './routes/ui.js';
 import { BridgeAuth } from './services/AukiAuthService.js';
@@ -38,6 +39,7 @@ app.use('/card', requireConfigured, cardRoutes);
 app.use('/session', requireConfigured, sessionRoutes);
 app.use('/qr', requireConfigured, qrRoutes);
 app.use('/deploy', requireConfigured, deployRoutes);
+app.use('/inventory', requireConfigured, inventoryRoutes);
 
 // Web UI
 app.use('/', uiRoutes);

@@ -216,10 +216,33 @@
         </div>
       </details>
 
-      <!-- Card list -->
-      <h2 class="text-lg font-semibold mb-3">Context Cards</h2>
-      <div id="cards-list" class="space-y-4">
-        <p class="text-gray-500">Loading...</p>
+      <!-- Domain inventory (tabbed) -->
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex gap-1 text-sm">
+          <button type="button" data-tab="cards" class="inv-tab px-3 py-1.5 rounded bg-gray-800 border border-gray-700">
+            Context Cards <span id="tab-count-cards" class="text-gray-500"></span>
+          </button>
+          <button type="button" data-tab="orphans" class="inv-tab px-3 py-1.5 rounded bg-gray-900 border border-gray-800 text-gray-400 hover:text-white">
+            Orphans <span id="tab-count-orphans" class="text-red-400"></span>
+          </button>
+        </div>
+        <button id="inventory-refresh" class="text-xs text-gray-400 hover:text-white">Refresh</button>
+      </div>
+
+      <div id="tab-cards">
+        <div id="cards-list" class="space-y-4">
+          <p class="text-gray-500">Loading...</p>
+        </div>
+      </div>
+
+      <div id="tab-orphans" class="hidden">
+        <p class="text-xs text-gray-500 mb-3">
+          Entries on your Auki Domain that no longer belong to a complete card — usually leftovers from failed deploys
+          or deletes done outside the bridge. Safe to remove.
+        </p>
+        <div id="orphans-list" class="space-y-3">
+          <p class="text-gray-500">Loading...</p>
+        </div>
       </div>
     </div>
   </div>
@@ -434,14 +457,49 @@
       }
     });
 
-    // ==================== CARDS ====================
-    async function loadCards() {
-      const el = document.getElementById('cards-list');
-      el.innerHTML = '<p class="text-gray-500">Loading...</p>';
+    // ==================== INVENTORY ====================
+    let activeInvTab = 'cards';
+
+    function setInvTab(name) {
+      activeInvTab = name;
+      document.querySelectorAll('.inv-tab').forEach(btn => {
+        const on = btn.dataset.tab === name;
+        btn.classList.toggle('bg-gray-800', on);
+        btn.classList.toggle('border-gray-700', on);
+        btn.classList.toggle('text-white', on);
+        btn.classList.toggle('bg-gray-900', !on);
+        btn.classList.toggle('border-gray-800', !on);
+        btn.classList.toggle('text-gray-400', !on);
+      });
+      document.getElementById('tab-cards').classList.toggle('hidden', name !== 'cards');
+      document.getElementById('tab-orphans').classList.toggle('hidden', name !== 'orphans');
+    }
+
+    async function loadInventory() {
+      const cardsEl = document.getElementById('cards-list');
+      const orphEl = document.getElementById('orphans-list');
+      cardsEl.innerHTML = '<p class="text-gray-500">Loading...</p>';
+      orphEl.innerHTML = '<p class="text-gray-500">Loading...</p>';
       try {
-        const resp = await apiFetch('/card');
-        const cards = await resp.json();
-        if (cards.length === 0) {
+        const resp = await apiFetch('/inventory');
+        const inv = await resp.json();
+        renderCards(inv.cards || []);
+        renderOrphans(inv.orphan_registries || [], inv.orphan_qr_images || []);
+        const orphanTotal = (inv.orphan_registries?.length || 0) + (inv.orphan_qr_images?.length || 0);
+        document.getElementById('tab-count-cards').textContent = inv.cards?.length ? `(${inv.cards.length})` : '';
+        document.getElementById('tab-count-orphans').textContent = orphanTotal ? `(${orphanTotal})` : '';
+      } catch (err) {
+        cardsEl.innerHTML = `<p class="text-red-400">${esc(err.message)}</p>`;
+        orphEl.innerHTML = '';
+      }
+    }
+
+    // Preserve the old name — deploy/delete handlers still call loadCards().
+    const loadCards = loadInventory;
+
+    function renderCards(cards) {
+      const el = document.getElementById('cards-list');
+      if (cards.length === 0) {
           el.innerHTML = `
             <div class="p-5 bg-gray-900 rounded border border-gray-800">
               <p class="text-gray-300 font-medium mb-2">No context cards on this domain yet.</p>
@@ -464,50 +522,104 @@
             </div>`;
           return;
         }
-        el.innerHTML = '';
-        for (const c of cards) {
-          const card = document.createElement('div');
-          card.className = 'p-4 bg-gray-800 rounded border border-gray-700';
+      el.innerHTML = '';
+      for (const c of cards) {
+        const row = document.createElement('div');
+        row.className = 'p-4 bg-gray-800 rounded border border-gray-700';
 
-          const registryKey = c._registry_key;
-          const displayName = registryKey || c._name || c._data_id;
-          const bodyPreview = c.body ? c.body.slice(0, 200) + (c.body.length > 200 ? '...' : '') : '(no body)';
-          const toolCount = c.tools ? c.tools.length : 0;
-          const resolveUrl = registryKey ? API + '/resolve/' + encodeURIComponent(registryKey) : null;
+        const body = c.card?.body || '';
+        const tools = c.card?.tools || [];
+        const executeUrl = c.card?.execute_url || null;
+        const registryKey = c.registry?.key || null;
+        const displayName = registryKey || c.name || c.data_id;
+        const bodyPreview = body ? body.slice(0, 200) + (body.length > 200 ? '...' : '') : '(no body)';
+        const resolveUrl = registryKey ? API + '/resolve/' + encodeURIComponent(registryKey) : null;
+        const issueBadges = (c.issues || []).map(tag => {
+          const label = tag.replace(/_/g, ' ');
+          return `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-800">${esc(label)}</span>`;
+        }).join(' ');
 
-          card.innerHTML = `
-            <div class="flex gap-4">
-              ${registryKey ? `
-              <div class="shrink-0 cursor-pointer qr-thumb" data-key="${esc(registryKey)}">
-                <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">Loading QR</div>
-              </div>` : `
-              <div class="shrink-0">
-                <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">No QR</div>
-              </div>`}
-              <div class="flex-1 min-w-0">
-                <div class="flex justify-between items-start">
-                  <div>
-                    <h3 class="font-medium text-base">${esc(displayName)}</h3>
-                    ${registryKey ? `<p class="text-xs text-green-500 font-mono mb-1">/resolve/${esc(registryKey)}</p>` : ''}
-                    <p class="text-xs text-gray-500 font-mono mb-2">${esc(c._data_id)}</p>
-                  </div>
-                  <button onclick="deleteCard('${esc(c._data_id)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
+        row.innerHTML = `
+          <div class="flex gap-4">
+            ${registryKey ? `
+            <div class="shrink-0 cursor-pointer qr-thumb" data-key="${esc(registryKey)}">
+              <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">Loading QR</div>
+            </div>` : `
+            <div class="shrink-0">
+              <div class="w-24 h-24 bg-gray-700 rounded flex items-center justify-center text-xs text-gray-500">No QR</div>
+            </div>`}
+            <div class="flex-1 min-w-0">
+              <div class="flex justify-between items-start">
+                <div>
+                  <h3 class="font-medium text-base">${esc(displayName)}</h3>
+                  ${registryKey ? `<p class="text-xs text-green-500 font-mono mb-1">/resolve/${esc(registryKey)}</p>` : ''}
+                  <p class="text-xs text-gray-500 font-mono mb-2">${esc(c.data_id)}</p>
+                  ${issueBadges ? `<div class="flex gap-1 mb-2 flex-wrap">${issueBadges}</div>` : ''}
                 </div>
-                <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
-                ${toolCount > 0 ? `<p class="text-xs text-gray-500">${toolCount} tool${toolCount > 1 ? 's' : ''}: ${esc(c.tools.map(t => t.name).join(', '))}</p>` : ''}
-                ${c.execute_url ? `<p class="text-xs text-gray-500 font-mono truncate mt-1">${esc(c.execute_url)}</p>` : ''}
-                ${c._error ? `<p class="text-xs text-red-400">${esc(c._error)}</p>` : ''}
+                <button onclick="deleteCard('${esc(c.data_id)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
               </div>
+              <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
+              ${tools.length > 0 ? `<p class="text-xs text-gray-500">${tools.length} tool${tools.length > 1 ? 's' : ''}: ${esc(tools.map(t => t.name).join(', '))}</p>` : ''}
+              ${executeUrl ? `<p class="text-xs text-gray-500 font-mono truncate mt-1">${esc(executeUrl)}</p>` : ''}
             </div>
-          `;
-          el.appendChild(card);
+          </div>
+        `;
+        el.appendChild(row);
 
-          if (registryKey) {
-            loadQrThumb(card.querySelector('.qr-thumb'), registryKey, resolveUrl);
-          }
+        if (registryKey) {
+          loadQrThumb(row.querySelector('.qr-thumb'), registryKey, resolveUrl);
         }
+      }
+    }
+
+    function renderOrphans(registries, qrImages) {
+      const el = document.getElementById('orphans-list');
+      if (registries.length === 0 && qrImages.length === 0) {
+        el.innerHTML = '<p class="p-4 bg-gray-900 rounded border border-gray-800 text-sm text-gray-400">Nothing orphaned. Your domain is clean.</p>';
+        return;
+      }
+      const rows = [];
+      for (const r of registries) {
+        const reasonLabel = r.reason === 'card_missing'
+          ? 'Points at a card that no longer exists'
+          : 'Missing card_id field';
+        rows.push(`
+          <div class="p-3 bg-gray-900 rounded border border-gray-800 flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 border border-gray-700">qr_registry</span>
+                <span class="text-sm font-medium">${esc(r.key || r.name || r.data_id)}</span>
+              </div>
+              <p class="text-xs text-gray-500">${esc(reasonLabel)}</p>
+              <p class="text-xs text-gray-600 font-mono truncate">${esc(r.data_id)}</p>
+            </div>
+            <button onclick="deleteOrphan('${esc(r.data_id)}', 'registry ${esc(r.key || r.name || r.data_id)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0">Delete</button>
+          </div>`);
+      }
+      for (const q of qrImages) {
+        rows.push(`
+          <div class="p-3 bg-gray-900 rounded border border-gray-800 flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 border border-gray-700">qr_image</span>
+                <span class="text-sm font-medium">${esc(q.name || q.data_id)}</span>
+              </div>
+              <p class="text-xs text-gray-500">No live registry claims this image</p>
+              <p class="text-xs text-gray-600 font-mono truncate">${esc(q.data_id)}</p>
+            </div>
+            <button onclick="deleteOrphan('${esc(q.data_id)}', 'QR image ${esc(q.name || q.data_id)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0">Delete</button>
+          </div>`);
+      }
+      el.innerHTML = rows.join('');
+    }
+
+    async function deleteOrphan(dataId, label) {
+      if (!confirm('Delete ' + label + '?')) return;
+      try {
+        await apiFetch('/inventory/orphan/' + encodeURIComponent(dataId), { method: 'DELETE' });
+        loadInventory();
       } catch (err) {
-        el.innerHTML = `<p class="text-red-400">${esc(err.message)}</p>`;
+        alert('Delete failed: ' + err.message);
       }
     }
 
@@ -566,6 +678,10 @@
 
     // ==================== SETTINGS MODAL ====================
     document.getElementById('settings-btn').addEventListener('click', openSettings);
+    document.querySelectorAll('.inv-tab').forEach(btn => {
+      btn.addEventListener('click', () => setInvTab(btn.dataset.tab));
+    });
+    document.getElementById('inventory-refresh').addEventListener('click', loadInventory);
 
     async function openSettings() {
       const modal = document.getElementById('settings-modal');
