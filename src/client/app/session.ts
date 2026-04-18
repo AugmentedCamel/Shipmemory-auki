@@ -14,7 +14,7 @@ import type { env as Env } from '../config/env.js';
 import { streamState } from '../index.js';
 
 const TOOL_TIMEOUT_MS = 10_000;
-const SCAN_TIMEOUT_MS = 30_000;
+const SCAN_TIMEOUT_MS = 120_000;
 const GEMINI_FRAME_INTERVAL_MS = 1000;
 
 export class SessionOrchestrator {

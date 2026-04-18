@@ -308,7 +308,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       #start-btn:disabled { opacity:0.4; cursor:not-allowed; }
     </style>
     <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:340px; line-height:1.45;">
-      Tap Start to begin. The camera starts, looks for a QR code for up to 30 seconds, then Gemini Live takes over for voice. The camera stays off until you tap.
+      Tap Start to begin. The camera starts, looks for a QR code for up to 2 minutes, then Gemini Live takes over for voice. The camera stays off until you tap.
     </div>
   </div>
 
