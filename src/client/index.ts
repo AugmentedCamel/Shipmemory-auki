@@ -105,7 +105,17 @@ class ShipMemoryApp extends AppServer {
       console.error(`[ShipMemory] Session error: ${sessionId}`, err instanceof Error ? err.message : err);
     });
 
-    await orchestrator.start();
+    // If start() throws (e.g. QR scan timeout), the SDK logs "Failed to connect"
+    // but doesn't disconnect the WebSocket or know about our orchestrator.
+    // Without this catch, WHEP keeps pulling frames and the Cloudflare stream
+    // leaks forever.
+    try {
+      await orchestrator.start();
+    } catch (err) {
+      console.error(`[ShipMemory] orchestrator.start() failed for ${sessionId} — cleaning up`, err);
+      this.cleanupSession(sessionId, 'start-failed');
+      throw err;
+    }
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
