@@ -23,20 +23,41 @@ import { DomainStorageService } from './DomainStorageService.js';
 
 export const REGISTRY_TYPE = 'registry';
 export const TOOL_PRESET_TYPE = 'tool_preset';
-export const NAME_CARD = 'card';
-export const NAME_QR = 'qr';
 
 export function assetType(assetId: string): string {
   return `asset:${assetId}`;
 }
 
-export function sessionName(sessionId: string, turn: number): string {
+/**
+ * Names inside an asset folder must be domain-wide unique — the Auki domain
+ * enforces uniqueness across the whole domain, not per data_type. Prefixing
+ * every filename with the asset_id keeps the folder model intact while
+ * preventing collisions across folders.
+ */
+export function cardNameFor(assetId: string): string {
+  return `${assetId}_card`;
+}
+export function qrNameFor(assetId: string): string {
+  return `${assetId}_qr`;
+}
+export function sessionNameFor(assetId: string, sessionId: string, turn: number): string {
   // Zero-pad so lexical sort == chronological sort in listByType output.
-  return `session:${sessionId}:${String(turn).padStart(6, '0')}`;
+  return `${assetId}_session_${sessionId}_${String(turn).padStart(6, '0')}`;
 }
 
-export function parseSessionName(name: string): { sessionId: string; turn: number } | null {
-  const m = /^session:([^:]+):(\d+)$/.exec(name);
+/**
+ * Parse a session entry name back into (sessionId, turn). The assetId is
+ * always known at call time (we list by its data_type to find these names),
+ * so we strip the asset prefix and match the trailing numeric turn.
+ */
+export function parseSessionName(
+  name: string,
+  assetId: string,
+): { sessionId: string; turn: number } | null {
+  const prefix = `${assetId}_session_`;
+  if (!name.startsWith(prefix)) return null;
+  const rest = name.slice(prefix.length);
+  const m = /^(.+)_(\d+)$/.exec(rest);
   if (!m) return null;
   return { sessionId: m[1], turn: parseInt(m[2], 10) };
 }
@@ -114,7 +135,8 @@ export async function loadCardForResolved(
 ): Promise<{ card: unknown; card_data_id: string } | null> {
   if (resolved.via === 'registry') {
     const items = await DomainStorageService.listByType(auth, domainId, assetType(resolved.asset_id));
-    const entry = items.find((i: DomainItem) => i.name === NAME_CARD);
+    const expected = cardNameFor(resolved.asset_id);
+    const entry = items.find((i: DomainItem) => i.name === expected);
     const id = entry ? idOf(entry) : undefined;
     if (!id) return null;
     const raw = await DomainStorageService.load(auth, domainId, id);
@@ -132,7 +154,8 @@ export async function findQrDataId(
 ): Promise<string | null> {
   if (resolved.via === 'registry') {
     const items = await DomainStorageService.listByType(auth, domainId, assetType(resolved.asset_id));
-    const entry = items.find((i: DomainItem) => i.name === NAME_QR);
+    const expected = qrNameFor(resolved.asset_id);
+    const entry = items.find((i: DomainItem) => i.name === expected);
     return (entry && idOf(entry)) || null;
   }
   const imgs = await DomainStorageService.listByType(auth, domainId, 'qr_image');

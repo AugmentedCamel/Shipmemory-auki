@@ -6,7 +6,7 @@ import { DomainStorageService } from '../services/DomainStorageService.js';
 import {
   assetType,
   findQrDataId,
-  NAME_QR,
+  qrNameFor,
   resolveKey,
 } from '../services/DomainLayout.js';
 
@@ -43,7 +43,7 @@ qrRoutes.get('/:key', requireApiKey, async (req, res) => {
     // Persist if we know where the asset folder is.
     if (resolved?.via === 'registry') {
       await DomainStorageService.store(auth, domainId, pngBuffer, {
-        name: NAME_QR,
+        name: qrNameFor(resolved.asset_id),
         dataType: assetType(resolved.asset_id),
         contentType: 'image/png',
       });

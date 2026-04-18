@@ -7,9 +7,9 @@ import { DomainStorageService } from '../services/DomainStorageService.js';
 import { ContextCardSchema } from '../schemas/contextcard.js';
 import {
   REGISTRY_TYPE,
-  NAME_CARD,
-  NAME_QR,
   assetType,
+  cardNameFor,
+  qrNameFor,
   resolveKey,
 } from '../services/DomainLayout.js';
 
@@ -87,7 +87,7 @@ deployRoutes.post('/', requireApiKey, async (req, res) => {
         domainAuth,
         domainId,
         JSON.stringify(validation.data),
-        { name: NAME_CARD, dataType: folder, contentType: 'application/json' },
+        { name: cardNameFor(assetId), dataType: folder, contentType: 'application/json' },
       ),
     );
 
@@ -99,7 +99,7 @@ deployRoutes.post('/', requireApiKey, async (req, res) => {
         domainAuth,
         domainId,
         pngBuffer,
-        { name: NAME_QR, dataType: folder, contentType: 'image/png' },
+        { name: qrNameFor(assetId), dataType: folder, contentType: 'image/png' },
       ),
     );
 
@@ -159,23 +159,27 @@ deployRoutes.put('/:asset_id', requireApiKey, async (req, res) => {
 
     const folder = assetType(assetId);
     const items = await DomainStorageService.listByType(domainAuth, domainId, folder);
-    const existingCard = items.find((i: DomainItem) => i.name === NAME_CARD);
+    const expectedName = cardNameFor(assetId);
+    const existingCard = items.find((i: DomainItem) => i.name === expectedName);
+
+    // Replace strategy: delete the old card first to free the unique name,
+    // then write the new one. If the delete fails we surface it so the
+    // caller doesn't think the update landed.
+    if (existingCard && idOf(existingCard)) {
+      try {
+        await DomainStorageService.delete(domainAuth, domainId, idOf(existingCard)!);
+      } catch (e: any) {
+        res.status(500).json({ error: 'Could not replace card', detail: e?.message });
+        return;
+      }
+    }
 
     const newCardDataId = await DomainStorageService.store(
       domainAuth,
       domainId,
       JSON.stringify(validation.data),
-      { name: NAME_CARD, dataType: folder, contentType: 'application/json' },
+      { name: expectedName, dataType: folder, contentType: 'application/json' },
     );
-
-    // Best-effort remove the old card file after the new one is in place.
-    if (existingCard && idOf(existingCard) && idOf(existingCard) !== newCardDataId) {
-      try {
-        await DomainStorageService.delete(domainAuth, domainId, idOf(existingCard)!);
-      } catch (e) {
-        console.warn('[deploy PUT] stale card delete failed:', (e as Error).message);
-      }
-    }
 
     res.json({ asset_id: assetId, card_data_id: newCardDataId });
   } catch (err: any) {

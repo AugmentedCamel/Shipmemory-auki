@@ -1,6 +1,6 @@
 import type { DomainAuth } from './AukiAuthService.js';
 import { DomainStorageService } from './DomainStorageService.js';
-import { assetType, parseSessionName, sessionName } from './DomainLayout.js';
+import { assetType, parseSessionName, sessionNameFor } from './DomainLayout.js';
 
 type DomainItem = { id?: string; data_id?: string; name?: string };
 const idOf = (i: DomainItem) => i.id || i.data_id;
@@ -27,7 +27,7 @@ export async function appendEntry(
   let nextTurn = 0;
   for (const item of items) {
     if (!item.name) continue;
-    const parsed = parseSessionName(item.name);
+    const parsed = parseSessionName(item.name, assetId);
     if (parsed && parsed.sessionId === sessionId) {
       nextTurn = Math.max(nextTurn, parsed.turn + 1);
     }
@@ -40,7 +40,7 @@ export async function appendEntry(
     ...extra,
     created_at: new Date().toISOString(),
   };
-  const name = sessionName(sessionId, nextTurn);
+  const name = sessionNameFor(assetId, sessionId, nextTurn);
 
   const dataId = await DomainStorageService.store(auth, domainId, JSON.stringify(record), {
     name,
@@ -68,7 +68,7 @@ export async function fetchEntries(
   const matches: { item: DomainItem; sessionId: string; turn: number }[] = [];
   for (const item of items) {
     if (!item.name) continue;
-    const parsed = parseSessionName(item.name);
+    const parsed = parseSessionName(item.name, assetId);
     if (!parsed) continue;
     if (opts.sessionId && parsed.sessionId !== opts.sessionId) continue;
     matches.push({ item, sessionId: parsed.sessionId, turn: parsed.turn });

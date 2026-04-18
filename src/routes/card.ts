@@ -3,7 +3,7 @@ import { requireApiKey } from '../middleware/apiKey.js';
 import { BridgeAuth } from '../services/AukiAuthService.js';
 import { DomainStorageService } from '../services/DomainStorageService.js';
 import { ContextCardSchema } from '../schemas/contextcard.js';
-import { REGISTRY_TYPE, NAME_CARD, assetType } from '../services/DomainLayout.js';
+import { REGISTRY_TYPE, assetType, cardNameFor } from '../services/DomainLayout.js';
 
 export const cardRoutes = Router();
 
@@ -37,7 +37,7 @@ cardRoutes.get('/', requireApiKey, async (_req, res) => {
 
         const folder = assetType(assetId);
         const items = await DomainStorageService.listByType(auth, domainId, folder);
-        const cardItem = items.find((i: DomainItem) => i.name === NAME_CARD);
+        const cardItem = items.find((i: DomainItem) => i.name === cardNameFor(assetId));
         if (!cardItem || !idOf(cardItem)) {
           out.push({ _layout: 'asset', _asset_id: assetId, _registry_key: key, _error: 'Missing card in asset folder' });
           continue;

@@ -5,9 +5,9 @@ import { DomainStorageService } from '../services/DomainStorageService.js';
 import { ContextCardSchema } from '../schemas/contextcard.js';
 import {
   REGISTRY_TYPE,
-  NAME_CARD,
-  NAME_QR,
   assetType,
+  cardNameFor,
+  qrNameFor,
   parseSessionName,
 } from '../services/DomainLayout.js';
 
@@ -67,8 +67,8 @@ inventoryRoutes.get('/', requireApiKey, async (_req, res) => {
       }
 
       const items = await DomainStorageService.listByType(auth, domainId, assetType(assetId));
-      const cardItem = items.find((i: DomainItem) => i.name === NAME_CARD);
-      const qrItem = items.find((i: DomainItem) => i.name === NAME_QR);
+      const cardItem = items.find((i: DomainItem) => i.name === cardNameFor(assetId));
+      const qrItem = items.find((i: DomainItem) => i.name === qrNameFor(assetId));
 
       if (!cardItem || !idOf(cardItem)) {
         orphanRegistries.push({
@@ -94,10 +94,12 @@ inventoryRoutes.get('/', requireApiKey, async (_req, res) => {
       }
       if (!qrItem) issues.push('missing_qr');
 
-      const sessionTurns = items.filter((i: DomainItem) => i.name && parseSessionName(i.name));
+      const sessionTurns = items.filter(
+        (i: DomainItem) => i.name && parseSessionName(i.name, assetId),
+      );
       const sessionIds = new Set<string>();
       for (const t of sessionTurns) {
-        const p = t.name ? parseSessionName(t.name) : null;
+        const p = t.name ? parseSessionName(t.name, assetId) : null;
         if (p) sessionIds.add(p.sessionId);
       }
 
