@@ -67,32 +67,51 @@ deployRoutes.post('/', requireApiKey, async (req, res) => {
 
     const assetId = crypto.randomUUID();
     const folder = assetType(assetId);
+    console.log(`[deploy] key="${id}" asset_id=${assetId}`);
+
+    const step = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+      try {
+        return await fn();
+      } catch (e: any) {
+        const status = e?.response?.status;
+        const detail = e?.response?.data;
+        const detailStr = typeof detail === 'object' ? JSON.stringify(detail) : detail;
+        console.error(`[deploy] step="${label}" failed status=${status} detail=${detailStr} message=${e?.message}`);
+        throw e;
+      }
+    };
 
     // 1. Card inside the asset folder.
-    const cardDataId = await DomainStorageService.store(
-      domainAuth,
-      domainId,
-      JSON.stringify(validation.data),
-      { name: NAME_CARD, dataType: folder, contentType: 'application/json' },
+    const cardDataId = await step('store_card', () =>
+      DomainStorageService.store(
+        domainAuth,
+        domainId,
+        JSON.stringify(validation.data),
+        { name: NAME_CARD, dataType: folder, contentType: 'application/json' },
+      ),
     );
 
     // 2. QR PNG inside the asset folder.
     const resolveUrl = `${BRIDGE_BASE_URL}/resolve/${id}`;
     const pngBuffer = await QRCode.toBuffer(resolveUrl, { type: 'png', width: 400, margin: 2 });
-    const qrDataId = await DomainStorageService.store(
-      domainAuth,
-      domainId,
-      pngBuffer,
-      { name: NAME_QR, dataType: folder, contentType: 'image/png' },
+    const qrDataId = await step('store_qr', () =>
+      DomainStorageService.store(
+        domainAuth,
+        domainId,
+        pngBuffer,
+        { name: NAME_QR, dataType: folder, contentType: 'image/png' },
+      ),
     );
 
     // 3. Registry entry so /resolve can find the asset folder by key.
     const registry = { asset_id: assetId, key: id };
-    const registryDataId = await DomainStorageService.store(
-      domainAuth,
-      domainId,
-      JSON.stringify(registry),
-      { name: id, dataType: REGISTRY_TYPE, contentType: 'application/json' },
+    const registryDataId = await step('store_registry', () =>
+      DomainStorageService.store(
+        domainAuth,
+        domainId,
+        JSON.stringify(registry),
+        { name: id, dataType: REGISTRY_TYPE, contentType: 'application/json' },
+      ),
     );
 
     res.status(201).json({
@@ -104,8 +123,10 @@ deployRoutes.post('/', requireApiKey, async (req, res) => {
       resolve_url: resolveUrl,
     });
   } catch (err: any) {
-    console.error('[deploy]', err.message);
-    res.status(500).json({ error: 'Deploy failed', detail: err?.message });
+    const status = err?.response?.status;
+    const detail = err?.response?.data;
+    console.error('[deploy] failed', { status, detail, message: err?.message });
+    res.status(500).json({ error: 'Deploy failed', detail: err?.message, upstream_status: status, upstream: detail });
   }
 });
 
