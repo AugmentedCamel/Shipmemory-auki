@@ -355,8 +355,8 @@
       const btn = document.getElementById('api-key-submit');
       errEl.classList.add('hidden');
       const newKey = document.getElementById('api-key-input').value.trim();
-      if (newKey.length < 16) {
-        errEl.textContent = 'Pick at least 16 characters.';
+      if (newKey.length < 10) {
+        errEl.textContent = 'Pick at least 10 characters.';
         errEl.classList.remove('hidden');
         return;
       }
@@ -616,7 +616,7 @@
             <details>
               <summary class="cursor-pointer text-blue-400 hover:text-blue-300 text-xs">Change API key</summary>
               <form id="change-apikey-form" class="space-y-2 mt-3 bg-gray-950 p-3 rounded">
-                <input id="s-apikey-new" type="text" minlength="16" placeholder="New API key (min 16 chars)" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-xs font-mono" required ${envLocked.has('apiKey') ? 'disabled' : ''}>
+                <input id="s-apikey-new" type="text" minlength="10" placeholder="New API key (min 10 chars)" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-xs font-mono" required ${envLocked.has('apiKey') ? 'disabled' : ''}>
                 <p class="text-yellow-500 text-xs">Remember to update <code class="bg-gray-800 px-1 rounded">BRIDGE_API_KEY</code> in your Mentra / client apps after changing this.</p>
                 <p id="change-apikey-error" class="text-red-400 text-xs hidden"></p>
                 <button type="submit" class="px-3 py-1.5 bg-blue-600 rounded text-xs hover:bg-blue-500" ${envLocked.has('apiKey') ? 'disabled' : ''}>
