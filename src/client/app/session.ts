@@ -19,6 +19,10 @@ const GEMINI_FRAME_INTERVAL_MS = 1000;
 
 export class SessionOrchestrator {
   private state = AppState.IDLE;
+
+  getState(): AppState {
+    return this.state;
+  }
   private gemini: GeminiLiveClient;
   private whepClient: WeriftWhepClient;
   private contextProvider: ContextProvider;

@@ -50,11 +50,13 @@ class ShipMemoryApp extends AppServer {
     // until the user explicitly triggers orchestrator.start().
     express.get('/api/state', (_req, res) => {
       const sessionId = this.orchestrators.keys().next().value ?? null;
+      const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
       res.json({
         sessionId,
         hasSession: !!sessionId,
         started: sessionId ? this.startedSessions.has(sessionId) : false,
         streamStatus: streamState.status,
+        appState: orchestrator ? orchestrator.getState() : 'IDLE',
       });
     });
 
@@ -322,20 +324,11 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       0%, 100% { opacity: 0.3; }
       50% { opacity: 1; }
     }
-    #player {
-      display: none;
-      width: 100%;
-      height: 100%;
-    }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      background: #000;
-    }
   </style>
 </head>
 <body>
+  <div id="mode-badge" style="position:fixed; top:12px; right:12px; z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
+
   <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
     <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
     <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600; transition:opacity 0.2s;">Start</button>
@@ -350,9 +343,6 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
   <div id="status" style="display:none;">
     <p>Starting up livestream<span class="dot"> ...</span></p>
   </div>
-  <div id="player" style="display:none;">
-    <video id="video" autoplay muted playsinline></video>
-  </div>
   <div id="iframe-player" style="display:none; width:100%; height:100%;">
     <iframe id="preview-iframe" style="width:100%; height:100%; border:none;" allow="autoplay"></iframe>
   </div>
@@ -364,14 +354,25 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const startBtn = document.getElementById('start-btn');
     const gateHintEl = document.getElementById('gate-hint');
     const statusEl = document.getElementById('status');
-    const playerEl = document.getElementById('player');
-    const videoEl = document.getElementById('video');
     const iframePlayer = document.getElementById('iframe-player');
     const previewIframe = document.getElementById('preview-iframe');
     const logEl = document.getElementById('log');
+    const modeBadgeEl = document.getElementById('mode-badge');
     let started = false;
     let streamAttached = false;
     let startPressed = false;
+
+    const MODE_STYLES = {
+      IDLE:     { label: 'Idle',     bg: '#1f2937', fg: '#9ca3af' },
+      SCANNING: { label: 'Scanning', bg: '#78350f', fg: '#fde68a' },
+      SESSION:  { label: 'Session',  bg: '#064e3b', fg: '#6ee7b7' },
+    };
+    function renderMode(state) {
+      const s = MODE_STYLES[state] || MODE_STYLES.IDLE;
+      modeBadgeEl.textContent = s.label;
+      modeBadgeEl.style.background = s.bg;
+      modeBadgeEl.style.color = s.fg;
+    }
 
     function log(msg) {
       console.log(msg);
@@ -383,6 +384,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       try {
         const res = await fetch('/api/state');
         const s = await res.json();
+        renderMode(s.appState);
         if (!s.hasSession) {
           gateStatusEl.textContent = 'Waiting for glasses session — open the app on your glasses.';
           startBtn.style.display = 'none';
@@ -396,14 +398,15 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
             gateHintEl.style.display = 'block';
           }
         } else {
-          // User tapped Start — hide the gate, show the player flow
+          // User tapped Start — hide the gate, show the player flow.
+          // Keep pollGate running so the mode badge keeps updating as the
+          // orchestrator transitions SCANNING → SESSION.
           gateEl.style.display = 'none';
-          statusEl.style.display = 'block';
           if (!started) {
             started = true;
+            statusEl.style.display = 'block';
             poll();
           }
-          return;
         }
       } catch (e) {
         gateStatusEl.textContent = 'Connection error: ' + e;
@@ -438,81 +441,24 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       try {
         const res = await fetch('/api/stream');
         const data = await res.json();
-        log('Poll: status=' + data.status + ' webrtc=' + !!data.webrtcUrl + ' iframe=' + !!data.iframeUrl);
+        log('Poll: status=' + data.status + ' iframe=' + !!data.iframeUrl);
 
         if (data.status === 'active' && !streamAttached) {
-          streamAttached = true;
-
-          // Try WebRTC WHEP first (low latency, we can extract frames)
-          // Fall back to Cloudflare iframe preview
-          if (data.webrtcUrl) {
-            const ok = await tryWebRTC(data.webrtcUrl);
-            if (ok) return;
-          }
           if (data.iframeUrl) {
-            log('Falling back to iframe preview');
+            streamAttached = true;
+            log('Attaching Cloudflare preview iframe');
             statusEl.style.display = 'none';
             iframePlayer.style.display = 'block';
             previewIframe.src = data.iframeUrl;
             return;
           }
-          statusEl.innerHTML = '<p>No playable stream URL</p>';
+          // Active but no preview URL yet — keep polling, do not latch.
+          log('Stream active but no iframeUrl yet — waiting');
         }
       } catch (e) { log('Poll error: ' + e); }
 
       if (!streamAttached) setTimeout(poll, 2000);
     }
-
-    async function tryWebRTC(whepUrl) {
-      statusEl.innerHTML = '<p>Connecting via WebRTC<span class="dot"> ...</span></p>';
-      try {
-        const pc = new RTCPeerConnection();
-        pc.addTransceiver('video', { direction: 'recvonly' });
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-
-        pc.oniceconnectionstatechange = () => log('ICE: ' + pc.iceConnectionState);
-        pc.onconnectionstatechange = () => log('Conn: ' + pc.connectionState);
-
-        pc.ontrack = (e) => {
-          log('Track: ' + e.track.kind + ' streams=' + e.streams.length);
-          if (e.streams[0]) {
-            videoEl.srcObject = e.streams[0];
-            statusEl.style.display = 'none';
-            playerEl.style.display = 'block';
-            videoEl.play().catch(e => log('Play error: ' + e));
-          }
-        };
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        log('WHEP POST → ' + whepUrl.slice(0, 80));
-
-        const res = await fetch(whepUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/sdp' },
-          body: offer.sdp,
-        });
-
-        log('WHEP response: ' + res.status + ' ' + res.statusText);
-
-        if (!res.ok) {
-          const body = await res.text();
-          log('WHEP error: ' + body.slice(0, 300));
-          throw new Error('WHEP ' + res.status);
-        }
-
-        const answer = await res.text();
-        log('SDP answer: ' + answer.length + ' bytes');
-        await pc.setRemoteDescription({ type: 'answer', sdp: answer });
-        log('Remote description set — waiting for tracks');
-        return true;
-      } catch (err) {
-        log('WebRTC failed: ' + err);
-        return false;
-      }
-    }
-
-    poll();
   </script>
 </body>
 </html>`;
