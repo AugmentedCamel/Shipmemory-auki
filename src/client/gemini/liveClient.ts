@@ -210,9 +210,12 @@ export class GeminiLiveClient {
     }
     this.lastAudioSendTime = now;
 
-    // Reset the audioStreamEnd timer — send it after 1.5s of silence
+    // Reset the audioStreamEnd timer. Mentra's mic is VAD-gated and stops
+    // delivering chunks during silence, so this fires once the glasses stop
+    // sending us anything. 500 ms is enough guard against a mic blip without
+    // letting the silence-detect dominate end-to-end latency.
     if (this.audioStreamEndTimer) clearTimeout(this.audioStreamEndTimer);
-    this.audioStreamEndTimer = setTimeout(() => this.sendAudioStreamEnd(), 1500);
+    this.audioStreamEndTimer = setTimeout(() => this.sendAudioStreamEnd(), 500);
 
     this.ws.send(JSON.stringify({
       realtimeInput: {
