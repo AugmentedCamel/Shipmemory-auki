@@ -14,9 +14,12 @@ export const streamState: {
   frameCount: number;
 } = { hlsUrl: null, webrtcUrl: null, previewUrl: null, dashUrl: null, status: 'idle', latestJpeg: null, latestJpegTime: 0, frameCount: 0 };
 
+const DISCONNECT_GRACE_MS = 30_000;
+
 class ShipMemoryApp extends AppServer {
   private orchestrators = new Map<string, SessionOrchestrator>();
   private startedSessions = new Set<string>();
+  private pendingDestroy = new Map<string, NodeJS.Timeout>();
 
   constructor() {
     super({
@@ -111,6 +114,10 @@ class ShipMemoryApp extends AppServer {
   protected async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
     console.log(`[ShipMemory] New session: ${sessionId} user: ${userId}`);
 
+    // If a pending grace-window destroy is in flight for this sessionId,
+    // cancel it — a new session (or reconnect) took its place.
+    this.clearPendingDestroy(sessionId);
+
     // Preemptive replace: during Mentra switching_clouds handoff, the new
     // session webhook can fire before the old session's onStop/onDisconnected.
     // Destroy any leftover orchestrator synchronously so its late-firing
@@ -137,8 +144,27 @@ class ShipMemoryApp extends AppServer {
         console.log(`[ShipMemory] Ignoring stale onDisconnected for ${sessionId} — orchestrator replaced`);
         return;
       }
-      console.log(`[ShipMemory] Session WebSocket disconnected: ${sessionId}`, data);
-      this.cleanupSession(sessionId, 'onDisconnected');
+      console.log(
+        `[ShipMemory] Session WebSocket disconnected: ${sessionId} — deferring cleanup ${DISCONNECT_GRACE_MS / 1000}s for possible reconnect`,
+        data,
+      );
+      // Grace window: glasses WiFi blip / brief drops shouldn't tear down
+      // Gemini + stream. Only destroy if no reconnect within DISCONNECT_GRACE_MS.
+      // onConnected / new onSession / onStop all cancel the timer.
+      if (this.pendingDestroy.has(sessionId)) return;
+      const timer = setTimeout(() => {
+        this.pendingDestroy.delete(sessionId);
+        if (this.orchestrators.get(sessionId) !== orchestrator) return;
+        console.log(`[ShipMemory] Grace window expired for ${sessionId} — cleaning up`);
+        this.cleanupSession(sessionId, 'grace-expired');
+      }, DISCONNECT_GRACE_MS);
+      this.pendingDestroy.set(sessionId, timer);
+    });
+    session.events.onConnected(() => {
+      if (this.pendingDestroy.has(sessionId)) {
+        console.log(`[ShipMemory] Session ${sessionId} reconnected — cancelling pending cleanup`);
+        this.clearPendingDestroy(sessionId);
+      }
     });
     // onError is observational only. The SDK fires it for every internal
     // WebSocket send failure after a drop, so using it to trigger cleanup
@@ -169,7 +195,16 @@ class ShipMemoryApp extends AppServer {
     this.cleanupSession(sessionId, `onStop:${reason}`);
   }
 
+  private clearPendingDestroy(sessionId: string): void {
+    const pending = this.pendingDestroy.get(sessionId);
+    if (pending) {
+      clearTimeout(pending);
+      this.pendingDestroy.delete(sessionId);
+    }
+  }
+
   private cleanupSession(sessionId: string, trigger: string): void {
+    this.clearPendingDestroy(sessionId);
     const orchestrator = this.orchestrators.get(sessionId);
     if (orchestrator) {
       orchestrator.destroy(trigger);
