@@ -327,7 +327,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id="mode-badge" style="position:fixed; top:12px; right:12px; z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
+  <div id="mode-badge" style="position:fixed; top:12px; left:50%; transform:translateX(-50%); z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
 
   <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
     <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
