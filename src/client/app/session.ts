@@ -6,7 +6,7 @@ import { WeriftWhepClient } from '../bridge/whepClient.js';
 import { FrameRelay, jpegToFrame } from '../bridge/frameConverter.js';
 import { subscribeMic } from '../mentra/mic.js';
 import { speak, showText } from '../mentra/display.js';
-import { startLivestream, stopLivestream } from '../mentra/camera.js';
+import { startLivestream, stopLivestream, type StreamStatusEvent } from '../mentra/camera.js';
 import { ShipMemoryService } from '../shipmemory/service.js';
 import { MockShipMemoryService, HardcodedUrlProvider } from '../shipmemory/mock.js';
 import type { ContextCard, ContextProvider } from '../shipmemory/types.js';
@@ -66,6 +66,8 @@ export class SessionOrchestrator {
 
   /** Stream URL for frame extraction (set after camera starts) */
   private streamUrl: string | null = null;
+  private unsubscribeStreamStatus: (() => void) | null = null;
+  private restartInFlight = false;
 
   async start(): Promise<void> {
     console.log(`[Session] Starting orchestrator (provider: ${this.contextProvider.constructor.name})`);
@@ -118,8 +120,9 @@ export class SessionOrchestrator {
   /** Start livestream synchronously — required before QR scanning can begin. */
   private async startCameraForScanning(): Promise<void> {
     streamState.status = 'starting';
-    const urls = await startLivestream(this.session);
+    const urls = await startLivestream(this.session, (ev) => this.handleStreamStatus(ev));
     this.streamUrl = urls.webrtcUrl ?? null;
+    this.unsubscribeStreamStatus = urls.unsubscribeStatus;
     streamState.hlsUrl = urls.hlsUrl;
     streamState.dashUrl = urls.dashUrl;
     streamState.webrtcUrl = urls.webrtcUrl ?? null;
@@ -135,8 +138,9 @@ export class SessionOrchestrator {
   private async startCamera(): Promise<void> {
     try {
       streamState.status = 'starting';
-      const urls = await startLivestream(this.session);
+      const urls = await startLivestream(this.session, (ev) => this.handleStreamStatus(ev));
       this.streamUrl = urls.webrtcUrl ?? null;
+      this.unsubscribeStreamStatus = urls.unsubscribeStatus;
       streamState.hlsUrl = urls.hlsUrl;
       streamState.dashUrl = urls.dashUrl;
       streamState.webrtcUrl = urls.webrtcUrl ?? null;
@@ -151,6 +155,66 @@ export class SessionOrchestrator {
     } catch (err) {
       console.warn('[Session] Camera stream failed, continuing voice-only:', err);
       streamState.status = 'idle';
+    }
+  }
+
+  /**
+   * React to post-startup managed-stream status changes (Mentra cloud → us).
+   * The one case we actively handle is `error`: Cloudflare / Mentra dropped the
+   * stream mid-session (e.g. Mentra bug #2526). We try exactly one restart.
+   */
+  private handleStreamStatus(event: StreamStatusEvent): void {
+    if (this.state === AppState.IDLE) return;
+    if (event.type === 'error') {
+      if (this.restartInFlight) {
+        console.warn('[Session] Stream error while restart already in flight — ignoring');
+        return;
+      }
+      console.warn(`[Session] Managed stream errored post-startup: ${event.message ?? 'no message'} — restarting`);
+      this.restartStream().catch((err) => {
+        console.error('[Session] restartStream failed:', err);
+        streamState.status = 'error';
+      });
+    }
+  }
+
+  /** Tear down the current WHEP/stream and ask Mentra for a fresh one. */
+  private async restartStream(): Promise<void> {
+    this.restartInFlight = true;
+    streamState.status = 'reconnecting';
+    // Clear the stale cached frame so Gemini's speech-start/end handlers
+    // don't re-send it while we reconnect.
+    streamState.latestJpeg = null;
+    streamState.latestJpegTime = 0;
+
+    try {
+      // Drop the dead listener and WHEP consumer from the previous stream.
+      this.unsubscribeStreamStatus?.();
+      this.unsubscribeStreamStatus = null;
+      safely('whep.stop on restart', () => this.whepClient.stop());
+      try {
+        await stopLivestream(this.session);
+      } catch (e) {
+        console.warn(`[Session] stopLivestream during restart failed: ${e instanceof Error ? e.message : e}`);
+      }
+
+      const urls = await startLivestream(this.session, (ev) => this.handleStreamStatus(ev));
+      this.unsubscribeStreamStatus = urls.unsubscribeStatus;
+      this.streamUrl = urls.webrtcUrl ?? null;
+      streamState.hlsUrl = urls.hlsUrl;
+      streamState.dashUrl = urls.dashUrl;
+      streamState.webrtcUrl = urls.webrtcUrl ?? null;
+      streamState.status = 'active';
+      console.log(`[Session] Camera stream restarted — WebRTC: ${this.streamUrl}`);
+
+      if (this.streamUrl) {
+        // Fresh WHEP client for the new URL. The old one was stopped above and
+        // its PeerConnection + ffmpeg are gone.
+        this.whepClient = new WeriftWhepClient(640, 480);
+        this.runWhepLoop().catch((err) => console.error('[Session] WHEP loop error (post-restart):', err));
+      }
+    } finally {
+      this.restartInFlight = false;
     }
   }
 
@@ -214,7 +278,7 @@ export class SessionOrchestrator {
         } else if (this.state === AppState.SESSION) {
           const now = Date.now();
           if ((now - lastGeminiSend) >= GEMINI_FRAME_INTERVAL_MS) {
-            this.gemini.sendVideoFrame(jpeg);
+            this.gemini.sendVideoFrame(jpeg, streamState.frameCount);
             lastGeminiSend = now;
           }
         }
@@ -325,6 +389,7 @@ export class SessionOrchestrator {
     safely('whep.stop',           () => this.whepClient.stop());
     safely('relay.stop',          () => this.frameRelay?.stop());
     safely('clearTranscription',  () => this.clearPendingTranscription());
+    safely('unsubscribeStream',   () => this.unsubscribeStreamStatus?.());
     stopLivestream(this.session).catch((e) =>
       console.warn(`[Session] stopLivestream failed: ${e instanceof Error ? e.message : e}`),
     );

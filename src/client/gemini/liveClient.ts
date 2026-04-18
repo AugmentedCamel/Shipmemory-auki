@@ -203,7 +203,7 @@ export class GeminiLiveClient {
       if (latest?.jpeg) {
         const ageMs = Date.now() - latest.capturedAt;
         console.log(`[Gemini:audio] Speech start — sending frame #${latest.frameNum} (age: ${ageMs}ms, ${(latest.jpeg.length / 1024).toFixed(1)}KB)`);
-        this.sendVideoFrame(latest.jpeg);
+        this.sendVideoFrame(latest.jpeg, latest.frameNum);
       } else {
         console.log('[Gemini:audio] Speech start — no frame available');
       }
@@ -235,7 +235,7 @@ export class GeminiLiveClient {
     if (latest?.jpeg) {
       const ageMs = Date.now() - latest.capturedAt;
       console.log(`[Gemini:audio] Sending frame #${latest.frameNum} before audioStreamEnd — age: ${ageMs}ms, size: ${(latest.jpeg.length / 1024).toFixed(1)}KB`);
-      this.sendVideoFrame(latest.jpeg);
+      this.sendVideoFrame(latest.jpeg, latest.frameNum);
     }
 
     console.log('[Gemini:audio] Sending audioStreamEnd (silence detected)');
@@ -247,10 +247,26 @@ export class GeminiLiveClient {
   }
 
   private videoFramesSent = 0;
+  private lastSentFrameId: number | string | null = null;
+  private skippedStaleFrames = 0;
 
-  /** Send a JPEG video frame to Gemini. */
-  sendVideoFrame(jpeg: Buffer): void {
+  /**
+   * Send a JPEG video frame to Gemini.
+   *
+   * If `frameId` is supplied and matches the last frame we already sent, the
+   * call is a no-op. This prevents resending a stale `latestJpeg` during speech
+   * start/end when the underlying camera stream has stopped producing frames.
+   */
+  sendVideoFrame(jpeg: Buffer, frameId?: number | string): void {
     if (!this.ready || !this.ws) return;
+    if (frameId != null && frameId === this.lastSentFrameId) {
+      this.skippedStaleFrames++;
+      if (this.skippedStaleFrames === 1 || this.skippedStaleFrames % 10 === 0) {
+        console.log(`[Gemini:video] Skipping stale frame #${frameId} (skipped=${this.skippedStaleFrames})`);
+      }
+      return;
+    }
+    this.lastSentFrameId = frameId ?? null;
     this.videoFramesSent++;
     if (this.videoFramesSent <= 3 || this.videoFramesSent % 10 === 0) {
       console.log(`[Gemini:video] Sending frame #${this.videoFramesSent} (${(jpeg.length / 1024).toFixed(1)}KB, ${jpegToBase64(jpeg).length} b64 chars)`);

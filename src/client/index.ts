@@ -8,7 +8,7 @@ export const streamState: {
   webrtcUrl: string | null;
   previewUrl: string | null;
   dashUrl: string | null;
-  status: 'idle' | 'starting' | 'active';
+  status: 'idle' | 'starting' | 'active' | 'reconnecting' | 'error';
   latestJpeg: Buffer | null;
   latestJpegTime: number;
   frameCount: number;
@@ -328,6 +328,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <div id="mode-badge" style="position:fixed; top:12px; left:50%; transform:translateX(-50%); z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
+  <div id="reconnect-banner" style="display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); z-index:49; padding:8px 18px; border-radius:10px; font-size:0.85rem; font-weight:600; background:#7c2d12; color:#fed7aa; letter-spacing:0.02em; box-shadow:0 4px 12px rgba(0,0,0,0.3);">Reconnecting stream…</div>
 
   <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
     <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
@@ -358,9 +359,11 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const previewIframe = document.getElementById('preview-iframe');
     const logEl = document.getElementById('log');
     const modeBadgeEl = document.getElementById('mode-badge');
+    const reconnectBannerEl = document.getElementById('reconnect-banner');
     let started = false;
     let streamAttached = false;
     let startPressed = false;
+    let attachedIframeUrl = null;
 
     const MODE_STYLES = {
       IDLE:     { label: 'Idle',     bg: '#1f2937', fg: '#9ca3af' },
@@ -385,6 +388,17 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         const res = await fetch('/api/state');
         const s = await res.json();
         renderMode(s.appState);
+        reconnectBannerEl.style.display = s.streamStatus === 'reconnecting' ? 'block' : 'none';
+        if (s.streamStatus === 'error') {
+          reconnectBannerEl.style.display = 'block';
+          reconnectBannerEl.textContent = 'Stream failed to reconnect';
+          reconnectBannerEl.style.background = '#7f1d1d';
+          reconnectBannerEl.style.color = '#fecaca';
+        } else if (s.streamStatus === 'reconnecting') {
+          reconnectBannerEl.textContent = 'Reconnecting stream…';
+          reconnectBannerEl.style.background = '#7c2d12';
+          reconnectBannerEl.style.color = '#fed7aa';
+        }
         if (!s.hasSession) {
           gateStatusEl.textContent = 'Waiting for glasses session — open the app on your glasses.';
           startBtn.style.display = 'none';
@@ -443,21 +457,29 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         const data = await res.json();
         log('Poll: status=' + data.status + ' iframe=' + !!data.iframeUrl);
 
-        if (data.status === 'active' && !streamAttached) {
-          if (data.iframeUrl) {
+        if (data.status === 'active' && data.iframeUrl) {
+          if (!streamAttached || data.iframeUrl !== attachedIframeUrl) {
             streamAttached = true;
+            attachedIframeUrl = data.iframeUrl;
             log('Attaching Cloudflare preview iframe');
             statusEl.style.display = 'none';
             iframePlayer.style.display = 'block';
             previewIframe.src = data.iframeUrl;
-            return;
           }
-          // Active but no preview URL yet — keep polling, do not latch.
-          log('Stream active but no iframeUrl yet — waiting');
+        } else if (data.status === 'reconnecting') {
+          // Preview iframe from the old stream is dead. Clear it and show the
+          // spinner until a new iframeUrl arrives.
+          if (streamAttached) {
+            streamAttached = false;
+            attachedIframeUrl = null;
+            iframePlayer.style.display = 'none';
+            previewIframe.src = 'about:blank';
+            statusEl.style.display = 'block';
+          }
         }
       } catch (e) { log('Poll error: ' + e); }
 
-      if (!streamAttached) setTimeout(poll, 2000);
+      setTimeout(poll, 2000);
     }
   </script>
 </body>

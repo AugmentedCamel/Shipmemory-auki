@@ -9,6 +9,16 @@ export interface LivestreamUrls {
   streamId: string;
 }
 
+export type StreamStatusEvent =
+  | { type: 'active'; streamId?: string; previewUrl?: string }
+  | { type: 'stopped'; streamId?: string }
+  | { type: 'error'; streamId?: string; message?: string };
+
+export interface LivestreamResult extends LivestreamUrls {
+  /** Call to stop receiving post-startup status events. */
+  unsubscribeStatus: () => void;
+}
+
 /**
  * Start a managed camera livestream via Mentra cloud.
  *
@@ -16,15 +26,21 @@ export interface LivestreamUrls {
  * `status === 'active'` before using playback URLs. Using URLs during the
  * `initializing`/`preparing` phase produces flaky WHEP handshakes.
  *
+ * After the stream reaches `active`, a persistent listener keeps running and
+ * forwards subsequent status events to `onStatusChange`. This is how we detect
+ * post-startup errors (Mentra #2526 / Cloudflare drops) that previously went
+ * unnoticed because the one-shot subscription was unsubscribed at `active`.
+ *
  * Note: HLS/DASH return 404 on Cloudflare — only WebRTC (WHEP) and the
  * preview iframe are usable.
  */
-export async function startLivestream(session: AppSession): Promise<LivestreamUrls> {
+export async function startLivestream(
+  session: AppSession,
+  onStatusChange?: (event: StreamStatusEvent) => void,
+): Promise<LivestreamResult> {
   console.log('[Mentra:camera] Starting managed livestream with WebRTC…');
   try {
-    const result = await attemptStart(session);
-    console.log('[Mentra:camera] Stream active:', JSON.stringify(result, null, 2));
-    return result;
+    return await attemptStart(session, onStatusChange);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // Only retry on timeout — other errors (auth, etc.) won't be fixed by
@@ -36,13 +52,16 @@ export async function startLivestream(session: AppSession): Promise<LivestreamUr
     await clearGhostStream(session);
 
     console.log('[Mentra:camera] Retrying managed livestream…');
-    const result = await attemptStart(session);
-    console.log('[Mentra:camera] Stream active (after retry):', JSON.stringify(result, null, 2));
-    return result;
+    return await attemptStart(session, onStatusChange);
   }
 }
 
-async function attemptStart(session: AppSession): Promise<LivestreamUrls> {
+async function attemptStart(
+  session: AppSession,
+  onStatusChange?: (event: StreamStatusEvent) => void,
+): Promise<LivestreamResult> {
+  let activeStreamId: string | undefined;
+
   const activeStatus = new Promise<void>((resolve, reject) => {
     const unsubscribe = session.camera.onManagedStreamStatus((status) => {
       console.log(`[Mentra:camera] Stream status: ${status.status}`, status.streamId ?? '');
@@ -53,6 +72,7 @@ async function attemptStart(session: AppSession): Promise<LivestreamUrls> {
       }
 
       if (status.status === 'active') {
+        activeStreamId = status.streamId;
         unsubscribe();
         resolve();
       } else if (status.status === 'error') {
@@ -68,7 +88,32 @@ async function attemptStart(session: AppSession): Promise<LivestreamUrls> {
   });
 
   await activeStatus;
-  return result;
+  console.log('[Mentra:camera] Stream active:', JSON.stringify(result, null, 2));
+
+  // Post-startup listener — fires for every subsequent status change for the
+  // lifetime of this stream. Caller is responsible for calling unsubscribeStatus
+  // on teardown (or when restarting, so the new stream's listener takes over).
+  const unsubscribeStatus = session.camera.onManagedStreamStatus((status) => {
+    // Ignore late events for streamIds other than the one we just activated.
+    // Without this, a stopped/error from the previous stream can trigger our
+    // error handler during a restart.
+    if (status.streamId && activeStreamId && status.streamId !== activeStreamId) return;
+
+    if (status.previewUrl) streamState.previewUrl = status.previewUrl;
+
+    if (status.status === 'active') {
+      console.log(`[Mentra:camera] Post-startup status: active ${status.streamId ?? ''}`);
+      onStatusChange?.({ type: 'active', streamId: status.streamId, previewUrl: status.previewUrl });
+    } else if (status.status === 'error') {
+      console.warn(`[Mentra:camera] Post-startup status: error ${status.streamId ?? ''} — ${status.message ?? 'no message'}`);
+      onStatusChange?.({ type: 'error', streamId: status.streamId, message: status.message });
+    } else if (status.status === 'stopped') {
+      console.log(`[Mentra:camera] Post-startup status: stopped ${status.streamId ?? ''}`);
+      onStatusChange?.({ type: 'stopped', streamId: status.streamId });
+    }
+  });
+
+  return { ...result, unsubscribeStatus };
 }
 
 async function clearGhostStream(session: AppSession): Promise<void> {
