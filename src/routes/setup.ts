@@ -6,7 +6,7 @@ import { requireApiKey } from '../middleware/apiKey.js';
 
 export const setupRoutes = Router();
 
-const MIN_API_KEY_LENGTH = 16;
+const MIN_API_KEY_LENGTH = 10;
 
 /**
  * Gate: when the bridge is fully configured, setup endpoints require the

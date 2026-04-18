@@ -125,25 +125,47 @@
       <!-- Step 3: API key -->
       <div id="step-3" class="step hidden">
         <h2 class="text-lg font-semibold mb-3">Step 3 — Set a Bridge API key</h2>
-        <p class="text-sm text-gray-400 mb-4">
-          This secret gates access to the bridge. <strong>Your client apps use it as <code class="bg-gray-800 px-1 rounded">BRIDGE_API_KEY</code></strong> (Mentra, Android, anything that scans your QR codes). It's also what you use to log back into this dashboard.
-        </p>
-        <p class="text-xs text-yellow-500 mb-4">
-          Pick something long and random — at least 16 characters. This is <em>not</em> your Auki password.
-        </p>
-        <form id="api-key-form" class="space-y-3">
-          <div>
-            <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">API key</label>
-            <input id="api-key-input" type="text" minlength="16" placeholder="e.g. sm_bridge_$(openssl rand -hex 16)" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm font-mono" required>
+
+        <!-- Env-locked variant: shown when API_KEY is provided by environment. -->
+        <div id="api-key-env-locked" class="hidden">
+          <div class="mb-4 p-4 bg-emerald-950/40 border border-emerald-900 rounded">
+            <p class="text-sm text-emerald-300 mb-1">
+              <span class="text-emerald-200 font-medium">✓ Set by environment variable on this deployment</span>
+            </p>
+            <p class="text-xs text-emerald-400/80">
+              Your host (Railway, Docker, etc.) already provides <code class="bg-gray-900 px-1 rounded">API_KEY</code>. Nothing to do here — just log in with that value on the next screen.
+            </p>
           </div>
-          <p id="api-key-error" class="text-red-400 text-sm hidden"></p>
           <div class="flex gap-2">
             <button type="button" onclick="gotoStep(2)" class="px-4 py-2 bg-gray-800 rounded text-sm hover:bg-gray-700">Back</button>
-            <button type="submit" id="api-key-submit" class="flex-1 p-2 bg-green-600 rounded font-medium hover:bg-green-500 text-sm">
-              Finish setup
+            <button type="button" id="api-key-env-continue" class="flex-1 p-2 bg-green-600 rounded font-medium hover:bg-green-500 text-sm">
+              Continue to login
             </button>
           </div>
-        </form>
+        </div>
+
+        <!-- Editable variant: user picks the key. -->
+        <div id="api-key-form-wrap">
+          <p class="text-sm text-gray-400 mb-4">
+            This secret gates access to the bridge. <strong>Your client apps use it as <code class="bg-gray-800 px-1 rounded">BRIDGE_API_KEY</code></strong> (Mentra, Android, anything that scans your QR codes). It's also what you use to log back into this dashboard.
+          </p>
+          <p class="text-xs text-yellow-500 mb-4">
+            Pick something random — at least 10 characters. This is <em>not</em> your Auki password.
+          </p>
+          <form id="api-key-form" class="space-y-3">
+            <div>
+              <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">API key</label>
+              <input id="api-key-input" type="text" minlength="10" placeholder="min 10 characters" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm font-mono" required>
+            </div>
+            <p id="api-key-error" class="text-red-400 text-sm hidden"></p>
+            <div class="flex gap-2">
+              <button type="button" onclick="gotoStep(2)" class="px-4 py-2 bg-gray-800 rounded text-sm hover:bg-gray-700">Back</button>
+              <button type="submit" id="api-key-submit" class="flex-1 p-2 bg-green-600 rounded font-medium hover:bg-green-500 text-sm">
+                Finish setup
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
 
@@ -153,6 +175,10 @@
       <p class="text-sm text-gray-400 mb-6">
         Deploy ContextCards to your Auki Domain. Each card becomes a scannable QR code that loads a live voice agent (system prompt + tools) into a ShipMemory client — Mentra Live glasses, Android, or any app that speaks the protocol.
       </p>
+      <div id="login-env-notice" class="hidden mb-4 p-3 bg-emerald-950/40 border border-emerald-900 rounded text-xs text-emerald-300">
+        <strong class="text-emerald-200">✓ API key is set by an environment variable on this deployment.</strong>
+        Log in with the value you configured in your host's (e.g. Railway) environment settings.
+      </div>
       <form id="login-form" class="space-y-4">
         <div>
           <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Bridge API key</label>
@@ -212,6 +238,10 @@
       for (const id of ['setup-view', 'login-view', 'dashboard-view']) {
         document.getElementById(id).classList.toggle('hidden', id !== name + '-view');
       }
+      if (name === 'login') {
+        const envLocked = !!(setupStatus && (setupStatus.envOverrides || []).includes('apiKey'));
+        document.getElementById('login-env-notice').classList.toggle('hidden', !envLocked);
+      }
     }
 
     async function fetchJson(path, opts = {}) {
@@ -241,7 +271,21 @@
         document.getElementById('dot-' + i).classList.toggle('bg-gray-700', i > n);
       }
       if (n === 2) renderAukiStep();
+      if (n === 3) renderApiKeyStep();
     }
+
+    function renderApiKeyStep() {
+      const envLocked = !!(setupStatus && (setupStatus.envOverrides || []).includes('apiKey'));
+      document.getElementById('api-key-env-locked').classList.toggle('hidden', !envLocked);
+      document.getElementById('api-key-form-wrap').classList.toggle('hidden', envLocked);
+    }
+
+    // Hooked at DOMContentLoaded time; fires when the user clicks "Continue to login"
+    // from the env-locked step 3 variant.
+    document.getElementById('api-key-env-continue').addEventListener('click', async () => {
+      setupStatus = await fetchJson('/api/setup/status');
+      showView('login');
+    });
 
     function renderAukiStep() {
       const env = new Set((setupStatus && setupStatus.envOverrides) || []);
@@ -290,7 +334,12 @@
         });
         // Refresh cached status — API key step + bootstrap may care.
         setupStatus = await fetchJson('/api/setup/status');
-        gotoStep(3);
+        if (setupStatus.configured) {
+          // API key was already env-provided; setup is done — send the user to login.
+          showView('login');
+        } else {
+          gotoStep(3);
+        }
       } catch (err) {
         errEl.textContent = err.message;
         errEl.classList.remove('hidden');
