@@ -45,28 +45,36 @@ setupRoutes.get('/status', (_req, res) => {
  */
 setupRoutes.post('/auki-login', setupAuth, async (req, res) => {
   try {
-    const email = (req.body?.email ?? '').trim();
-    const password = (req.body?.password ?? '').trim();
-    const domainId = (req.body?.domainId ?? '').trim();
-
-    if (!email || !password || !domainId) {
-      res.status(400).json({ error: 'email, password, and domainId are required' });
-      return;
-    }
-
     const snapshot = BridgeConfig.current();
-    if (snapshot.envOverrides.includes('aukiEmail') ||
-        snapshot.envOverrides.includes('aukiPassword') ||
-        snapshot.envOverrides.includes('aukiDomainId')) {
-      res.status(409).json({ error: 'Auki credentials are set via environment variables — edit them in your hosting dashboard' });
+
+    // Env-locked fields fall back to their env value — user doesn't need to
+    // (and can't) re-enter what the host already provides. Non-locked fields
+    // must come from the request body.
+    const email = snapshot.envOverrides.includes('aukiEmail')
+      ? (snapshot.aukiEmail ?? '')
+      : (req.body?.email ?? '').trim();
+    const password = snapshot.envOverrides.includes('aukiPassword')
+      ? (snapshot.aukiPassword ?? '')
+      : (req.body?.password ?? '');
+    const domainId = snapshot.envOverrides.includes('aukiDomainId')
+      ? (snapshot.aukiDomainId ?? '')
+      : (req.body?.domainId ?? '').trim();
+
+    const stillMissing: string[] = [];
+    if (!email) stillMissing.push('email');
+    if (!password) stillMissing.push('password');
+    if (!domainId) stillMissing.push('domainId');
+    if (stillMissing.length > 0) {
+      res.status(400).json({ error: `Missing: ${stillMissing.join(', ')}` });
       return;
     }
 
-    // Verify end-to-end before writing anything.
+    // Verify the full triple end-to-end against Auki before writing anything.
     const { accessToken } = await AukiAuthService.login(email, password);
     await AukiAuthService.mintDomainToken(accessToken, domainId);
 
-    // Persist. BridgeAuth listens for the change and re-inits itself.
+    // Persist. For env-locked fields the file write is a no-op at read time
+    // (env still wins), so this is safe even if the user only provided a subset.
     await BridgeConfig.setAuki(email, password, domainId);
 
     res.json({ ok: true });

@@ -83,18 +83,34 @@
         <p class="text-sm text-gray-400 mb-4">
           The bridge will verify these against Auki before saving. If the email/password or domain ID is wrong, you'll see an error.
         </p>
+        <div id="auki-env-notice" class="hidden mb-4 p-3 bg-emerald-950/40 border border-emerald-900 rounded text-xs text-emerald-300">
+          <strong class="text-emerald-200">Some fields are already set via environment variables.</strong>
+          You only need to fill in the remaining ones below.
+        </div>
         <form id="auki-form" class="space-y-3">
-          <div>
+          <div id="auki-email-group">
             <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Auki email</label>
-            <input id="auki-email" type="email" autocomplete="email" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm" required>
+            <div id="auki-email-slot">
+              <input id="auki-email" type="email" autocomplete="email" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm">
+            </div>
           </div>
-          <div>
+          <div id="auki-password-group">
             <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Auki password</label>
-            <input id="auki-password" type="password" autocomplete="current-password" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm" required>
+            <div id="auki-password-slot">
+              <input id="auki-password" type="password" autocomplete="current-password" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm">
+            </div>
           </div>
-          <div>
-            <label class="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Domain ID</label>
-            <input id="auki-domain-id" type="text" placeholder="2f7f0a1e-..." class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm font-mono" required>
+          <div id="auki-domain-group">
+            <div class="flex justify-between items-baseline mb-1">
+              <label class="block text-xs text-gray-500 uppercase tracking-wide">Domain ID</label>
+              <a href="https://console.auki.network/dashboard" target="_blank" rel="noopener" class="text-xs text-blue-400 hover:text-blue-300 underline">
+                Open Auki console ↗
+              </a>
+            </div>
+            <div id="auki-domain-slot">
+              <input id="auki-domain-id" type="text" placeholder="2f7f0a1e-..." class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm font-mono">
+            </div>
+            <p class="text-xs text-gray-500 mt-1">Paste the Domain ID from your dashboard.</p>
           </div>
           <p id="auki-error" class="text-red-400 text-sm hidden"></p>
           <div class="flex gap-2">
@@ -216,12 +232,43 @@
     }
 
     // ==================== SETUP WIZARD ====================
+    let setupStatus = null;  // cached /api/setup/status response
+
     function gotoStep(n) {
       for (let i = 1; i <= 3; i++) {
         document.getElementById('step-' + i).classList.toggle('hidden', i !== n);
         document.getElementById('dot-' + i).classList.toggle('bg-blue-500', i <= n);
         document.getElementById('dot-' + i).classList.toggle('bg-gray-700', i > n);
       }
+      if (n === 2) renderAukiStep();
+    }
+
+    function renderAukiStep() {
+      const env = new Set((setupStatus && setupStatus.envOverrides) || []);
+      const notice = document.getElementById('auki-env-notice');
+      notice.classList.toggle('hidden', !(env.has('aukiEmail') || env.has('aukiPassword') || env.has('aukiDomainId')));
+
+      // For each field: if env-locked, replace the input with a static "from environment" row.
+      // If not, leave the normal input in place (and make it required).
+      renderField('email', env.has('aukiEmail'), 'email', 'email');
+      renderField('password', env.has('aukiPassword'), 'password', 'current-password');
+      renderField('domain', env.has('aukiDomainId'), 'text', 'off');
+    }
+
+    function renderField(kind, locked, type, autocomplete) {
+      const slot = document.getElementById('auki-' + kind + '-slot');
+      if (locked) {
+        slot.innerHTML = `
+          <div class="flex items-center gap-2 p-2 bg-gray-800/50 rounded border border-gray-800 text-sm text-gray-400">
+            <span class="text-green-400">✓</span>
+            <span class="flex-1">Set by environment variable on this deployment</span>
+          </div>`;
+        return;
+      }
+      const id = kind === 'domain' ? 'auki-domain-id' : 'auki-' + kind;
+      const placeholder = kind === 'domain' ? '2f7f0a1e-...' : '';
+      const fontClass = kind === 'domain' ? ' font-mono' : '';
+      slot.innerHTML = `<input id="${id}" type="${type}" autocomplete="${autocomplete}" placeholder="${placeholder}" class="w-full p-2 bg-gray-800 rounded border border-gray-700 text-sm${fontClass}" required>`;
     }
 
     document.getElementById('auki-form').addEventListener('submit', async (e) => {
@@ -232,14 +279,17 @@
       btn.disabled = true;
       btn.textContent = 'Verifying with Auki...';
       try {
+        const env = new Set((setupStatus && setupStatus.envOverrides) || []);
+        const body = {};
+        if (!env.has('aukiEmail')) body.email = (document.getElementById('auki-email') || {}).value?.trim() || '';
+        if (!env.has('aukiPassword')) body.password = (document.getElementById('auki-password') || {}).value || '';
+        if (!env.has('aukiDomainId')) body.domainId = (document.getElementById('auki-domain-id') || {}).value?.trim() || '';
         await fetchJson('/api/setup/auki-login', {
           method: 'POST',
-          body: JSON.stringify({
-            email: document.getElementById('auki-email').value.trim(),
-            password: document.getElementById('auki-password').value,
-            domainId: document.getElementById('auki-domain-id').value.trim(),
-          }),
+          body: JSON.stringify(body),
         });
+        // Refresh cached status — API key step + bootstrap may care.
+        setupStatus = await fetchJson('/api/setup/status');
         gotoStep(3);
       } catch (err) {
         errEl.textContent = err.message;
@@ -599,8 +649,14 @@
     async function bootstrap() {
       try {
         const status = await fetchJson('/api/setup/status');
+        setupStatus = status;
         if (!status.configured) {
-          gotoStep(status.missing.includes('apiKey') && !status.missing.includes('aukiEmail') ? 3 : 1);
+          const missing = new Set(status.missing);
+          const needsAuki = missing.has('aukiEmail') || missing.has('aukiPassword') || missing.has('aukiDomainId');
+          const needsApiKey = missing.has('apiKey');
+          // If Auki is fully handled by env, skip the tutorial + login steps and
+          // go straight to the API key step. Otherwise start at the tutorial.
+          gotoStep(!needsAuki && needsApiKey ? 3 : 1);
           showView('setup');
           return;
         }
