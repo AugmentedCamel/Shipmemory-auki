@@ -56,21 +56,27 @@ public/
 └── index.html                  # SPA: API key login, deploy cards, view QR codes, delete cards
 ```
 
-## QR + Resolve Flow
+## QR + Resolve Flow (asset-folder layout)
 
 ```
 Deploy: User fills card ID + body in web UI
-  → POST /deploy creates: contextcard + qr_registry + qr_image on Auki domain
-  → QR encodes: https://{BRIDGE_BASE_URL}/resolve/{card_id}
+  → POST /deploy mints a fresh asset_id (UUID) and writes:
+      asset:<asset_id>/card  (ContextCard JSON)
+      asset:<asset_id>/qr    (PNG)
+      registry/<key>         ({ asset_id, key })
+  → QR encodes: https://{BRIDGE_BASE_URL}/resolve/{key}
 
-Resolve: Agent scans QR → app sees body starts with https:// → fetches URL + ?key=
-  → GET /resolve/{card_id}?key=xxx
-  → Bridge looks up qr_registry by name === card_id
-  → Loads linked contextcard by card_id from registry
-  → Validates against schema, returns ContextCard JSON
+Resolve: client GETs /resolve/{key}?key=...
+  → Bridge: listByType('registry') → find name==key → load → asset_id
+  → Bridge: listByType('asset:<asset_id>') → find name=='card' → load
+  → Validates, injects asset_id into response, returns ContextCard JSON
+
+Tool calls (session transcript) target the asset folder via asset_id:
+  POST /session/:asset_id/transcript   (append a turn)
+  GET  /session/:asset_id/transcript   (read turns; optional ?session_id=...)
 ```
 
-**Critical:** The QR registry `name` field must match the card ID used in the resolve URL. The deploy route handles this automatically. Old QR images baked with wrong URLs must be deleted and redeployed.
+Legacy flat layout (`contextcard`, `qr_registry`, `qr_image`, `session:{card_id}:{data_key}`) is still readable by `/resolve`, `/card`, `/qr`, and `/inventory` for backwards compatibility, but new deploys always write the asset-folder layout.
 
 ## ContextCard Schema
 
@@ -91,12 +97,23 @@ Matches the shipmemory Android client (`ContextCard.kt`) exactly:
 
 ## Domain Data Types
 
-| Data type | Purpose | Created by |
+Current (asset-folder):
+
+| Data type | Name convention | Purpose |
 |---|---|---|
-| `contextcard` | ContextCard JSON | `/deploy` |
-| `qr_registry` | Maps lookup key (name) → card data ID | `/deploy` |
-| `qr_image` | QR code PNGs (name: `qr_{key}`) | `/deploy` and `/qr` |
-| `session:{card_id}:{data_key}` | Per-session tool data | `/session` |
+| `registry` | `{key}` | `{ asset_id, key }` — QR lookup key → asset folder |
+| `asset:{asset_id}` | `card` | ContextCard JSON |
+| `asset:{asset_id}` | `qr` | QR code PNG |
+| `asset:{asset_id}` | `session:{sid}:{turn}` | Transcript entry (append-only, zero-padded turn) |
+
+Legacy (still readable, not written):
+
+| Data type | Purpose |
+|---|---|
+| `contextcard` | Free-standing ContextCard JSON |
+| `qr_registry` | `{ card_id, key }` — key → contextcard data_id |
+| `qr_image` | QR PNGs named `qr_{key}` |
+| `session:{card_id}:{data_key}` | Per-(card,key) buckets |
 
 ## Auki Domain API
 

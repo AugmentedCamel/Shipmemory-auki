@@ -3,133 +3,210 @@ import { requireApiKey } from '../middleware/apiKey.js';
 import { BridgeAuth } from '../services/AukiAuthService.js';
 import { DomainStorageService } from '../services/DomainStorageService.js';
 import { ContextCardSchema } from '../schemas/contextcard.js';
+import {
+  REGISTRY_TYPE,
+  NAME_CARD,
+  NAME_QR,
+  assetType,
+  parseSessionName,
+} from '../services/DomainLayout.js';
 
 export const inventoryRoutes = Router();
 
-type DomainItem = { id?: string; data_id?: string; name?: string; [k: string]: unknown };
-
-function idOf(item: DomainItem): string | undefined {
-  return item.id || item.data_id;
-}
+type DomainItem = { id?: string; data_id?: string; name?: string };
+const idOf = (i: DomainItem) => i.id || i.data_id;
 
 /**
  * GET /inventory?key=<api_key>
- * One-shot join of every contextcard with its qr_registry + qr_image entry,
- * plus the leftover orphans in each bucket. This is the source of truth
- * for the dashboard — what actually exists on the Auki domain right now.
+ * Joined view of every card on the domain across both layouts plus orphan
+ * buckets. This is the source of truth for the dashboard.
  */
 inventoryRoutes.get('/', requireApiKey, async (_req, res) => {
   try {
     const { auth, domainId } = await BridgeAuth.getDomainAuth();
 
-    const [cardItems, registryItems, qrItems] = await Promise.all([
+    const [modernRegs, legacyCards, legacyRegs, legacyQrs] = await Promise.all([
+      DomainStorageService.listByType(auth, domainId, REGISTRY_TYPE),
       DomainStorageService.listByType(auth, domainId, 'contextcard'),
       DomainStorageService.listByType(auth, domainId, 'qr_registry'),
       DomainStorageService.listByType(auth, domainId, 'qr_image'),
     ]);
 
-    // Parse all registries in parallel; drop the ones we can't read.
-    const registries = await Promise.all(
-      registryItems.map(async (reg: DomainItem) => {
-        const dataId = idOf(reg);
-        if (!dataId) return null;
-        try {
-          const raw = await DomainStorageService.load(auth, domainId, dataId);
-          const parsed = JSON.parse(raw.buffer.toString('utf-8'));
-          return {
-            data_id: dataId,
-            name: reg.name ?? null,
-            key: parsed.key || reg.name || null,
-            card_id: parsed.card_id || null,
-          };
-        } catch {
-          return { data_id: dataId, name: reg.name ?? null, key: null, card_id: null, _broken: true };
-        }
-      }),
-    );
-    const registriesClean = registries.filter((r): r is NonNullable<typeof r> => r !== null);
+    const cards: any[] = [];
+    const orphanRegistries: any[] = [];
 
-    // Build lookup tables once.
-    const registryByCardId = new Map<string, typeof registriesClean[number]>();
-    for (const r of registriesClean) {
-      if (r.card_id) registryByCardId.set(r.card_id, r);
+    // --- New layout ---
+    for (const reg of modernRegs) {
+      const regId = idOf(reg);
+      if (!regId) continue;
+      let parsed: any = null;
+      try {
+        const raw = await DomainStorageService.load(auth, domainId, regId);
+        parsed = JSON.parse(raw.buffer.toString('utf-8'));
+      } catch {
+        orphanRegistries.push({
+          layout: 'asset',
+          data_id: regId,
+          name: reg.name ?? null,
+          reason: 'unreadable',
+        });
+        continue;
+      }
+
+      const assetId: string | undefined = parsed?.asset_id;
+      const key = parsed?.key || reg.name || null;
+      if (!assetId) {
+        orphanRegistries.push({
+          layout: 'asset',
+          data_id: regId,
+          name: reg.name ?? null,
+          key,
+          reason: 'no_asset_id',
+        });
+        continue;
+      }
+
+      const items = await DomainStorageService.listByType(auth, domainId, assetType(assetId));
+      const cardItem = items.find((i: DomainItem) => i.name === NAME_CARD);
+      const qrItem = items.find((i: DomainItem) => i.name === NAME_QR);
+
+      if (!cardItem || !idOf(cardItem)) {
+        orphanRegistries.push({
+          layout: 'asset',
+          data_id: regId,
+          key,
+          asset_id: assetId,
+          reason: 'asset_missing_card',
+        });
+        continue;
+      }
+
+      let card: unknown = null;
+      const issues: string[] = [];
+      try {
+        const raw = await DomainStorageService.load(auth, domainId, idOf(cardItem)!);
+        const cardParsed = JSON.parse(raw.buffer.toString('utf-8'));
+        const validation = ContextCardSchema.safeParse(cardParsed);
+        if (validation.success) card = validation.data;
+        else { card = cardParsed; issues.push('invalid_schema'); }
+      } catch {
+        issues.push('load_failed');
+      }
+      if (!qrItem) issues.push('missing_qr');
+
+      const sessionTurns = items.filter((i: DomainItem) => i.name && parseSessionName(i.name));
+      const sessionIds = new Set<string>();
+      for (const t of sessionTurns) {
+        const p = t.name ? parseSessionName(t.name) : null;
+        if (p) sessionIds.add(p.sessionId);
+      }
+
+      cards.push({
+        layout: 'asset',
+        asset_id: assetId,
+        data_id: idOf(cardItem),
+        name: cardItem.name ?? null,
+        card,
+        registry: { data_id: regId, key },
+        qr_image: qrItem ? { data_id: idOf(qrItem), name: qrItem.name ?? null } : null,
+        session_count: sessionIds.size,
+        transcript_entries: sessionTurns.length,
+        issues,
+      });
     }
-    const qrByName = new Map<string, DomainItem>();
-    for (const q of qrItems) if (q.name) qrByName.set(q.name, q);
 
-    // Parse + classify cards.
-    const cards = await Promise.all(
-      cardItems.map(async (item: DomainItem) => {
-        const dataId = idOf(item);
-        if (!dataId) return null;
-        const registry = registryByCardId.get(dataId) || null;
-        const qrImage = registry?.key ? qrByName.get(`qr_${registry.key}`) || null : null;
-        const issues: string[] = [];
-
-        let card: unknown = null;
-        try {
-          const raw = await DomainStorageService.load(auth, domainId, dataId);
-          const parsed = JSON.parse(raw.buffer.toString('utf-8'));
-          const validation = ContextCardSchema.safeParse(parsed);
-          if (validation.success) {
-            card = validation.data;
-          } else {
-            card = parsed;
-            issues.push('invalid_schema');
-          }
-        } catch {
-          issues.push('load_failed');
+    // --- Legacy layout ---
+    const legacyRegByCardId = new Map<string, { data_id: string; key: string | null }>();
+    for (const reg of legacyRegs) {
+      const rid = idOf(reg);
+      if (!rid) continue;
+      try {
+        const raw = await DomainStorageService.load(auth, domainId, rid);
+        const parsed = JSON.parse(raw.buffer.toString('utf-8'));
+        if (parsed.card_id) {
+          legacyRegByCardId.set(parsed.card_id, { data_id: rid, key: parsed.key || reg.name || null });
+        } else {
+          orphanRegistries.push({ layout: 'legacy', data_id: rid, name: reg.name ?? null, reason: 'no_card_id' });
         }
+      } catch {
+        orphanRegistries.push({ layout: 'legacy', data_id: rid, name: reg.name ?? null, reason: 'unreadable' });
+      }
+    }
 
-        if (!registry) issues.push('missing_registry');
-        if (registry && !qrImage) issues.push('missing_qr_image');
+    const legacyCardIds = new Set(legacyCards.map(idOf).filter((x): x is string => !!x));
+    for (const item of legacyCards) {
+      const did = idOf(item);
+      if (!did) continue;
+      const reg = legacyRegByCardId.get(did);
+      const key = reg?.key || null;
+      let card: unknown = null;
+      const issues: string[] = [];
+      try {
+        const raw = await DomainStorageService.load(auth, domainId, did);
+        const parsed = JSON.parse(raw.buffer.toString('utf-8'));
+        const validation = ContextCardSchema.safeParse(parsed);
+        if (validation.success) card = validation.data;
+        else { card = parsed; issues.push('invalid_schema'); }
+      } catch {
+        issues.push('load_failed');
+      }
+      if (!reg) issues.push('missing_registry');
+      const qr = key ? legacyQrs.find((q: DomainItem) => q.name === `qr_${key}`) : null;
+      if (reg && !qr) issues.push('missing_qr_image');
 
-        return {
-          data_id: dataId,
-          name: item.name ?? null,
-          card,
-          registry: registry
-            ? { data_id: registry.data_id, key: registry.key, name: registry.name }
-            : null,
-          qr_image: qrImage ? { data_id: idOf(qrImage), name: qrImage.name ?? null } : null,
-          issues,
-        };
-      }),
+      cards.push({
+        layout: 'legacy',
+        asset_id: null,
+        data_id: did,
+        name: item.name ?? null,
+        card,
+        registry: reg ? { data_id: reg.data_id, key } : null,
+        qr_image: qr ? { data_id: idOf(qr), name: qr.name ?? null } : null,
+        session_count: null,
+        transcript_entries: null,
+        issues,
+      });
+    }
+
+    // Legacy registries pointing at a card that no longer exists.
+    for (const [cardId, reg] of legacyRegByCardId.entries()) {
+      if (!legacyCardIds.has(cardId)) {
+        orphanRegistries.push({
+          layout: 'legacy',
+          data_id: reg.data_id,
+          key: reg.key,
+          card_id: cardId,
+          reason: 'card_missing',
+        });
+      }
+    }
+
+    // Legacy QR images not claimed by a legacy registry key.
+    const liveLegacyQrNames = new Set(
+      Array.from(legacyRegByCardId.values())
+        .map((r) => (r.key ? `qr_${r.key}` : null))
+        .filter((x): x is string => !!x),
     );
-    const cardsClean = cards.filter((c): c is NonNullable<typeof c> => c !== null);
+    const orphanQrImages = legacyQrs
+      .filter((q: DomainItem) => !q.name || !liveLegacyQrNames.has(q.name))
+      .map((q: DomainItem) => ({ data_id: idOf(q), name: q.name ?? null }));
 
-    // Orphans: registries whose card_id isn't on the domain.
-    const cardIds = new Set(cardItems.map(idOf).filter((x): x is string => !!x));
-    const orphanRegistries = registriesClean
-      .filter((r) => !r.card_id || !cardIds.has(r.card_id))
-      .map((r) => ({
-        data_id: r.data_id,
-        name: r.name,
-        key: r.key,
-        card_id: r.card_id,
-        reason: !r.card_id ? 'no_card_id' : 'card_missing',
-      }));
-
-    // Orphans: qr_images whose name doesn't map back to a live registry key.
-    const liveQrNames = new Set(
-      registriesClean.filter((r) => r.key).map((r) => `qr_${r.key}`),
-    );
-    const orphanQrImages = qrItems
-      .filter((q) => !q.name || !liveQrNames.has(q.name))
-      .map((q) => ({ data_id: idOf(q), name: q.name ?? null }));
+    const issueCount =
+      cards.reduce((n, c) => n + (c.issues?.length || 0), 0) +
+      orphanRegistries.length +
+      orphanQrImages.length;
 
     res.json({
-      cards: cardsClean,
+      cards,
       orphan_registries: orphanRegistries,
       orphan_qr_images: orphanQrImages,
       summary: {
-        cards: cardsClean.length,
-        registries: registriesClean.length,
-        qr_images: qrItems.length,
-        issues:
-          cardsClean.reduce((n, c) => n + c.issues.length, 0) +
-          orphanRegistries.length +
-          orphanQrImages.length,
+        cards: cards.length,
+        asset_cards: cards.filter((c) => c.layout === 'asset').length,
+        legacy_cards: cards.filter((c) => c.layout === 'legacy').length,
+        registries: modernRegs.length + legacyRegs.length,
+        qr_images: legacyQrs.length + cards.filter((c) => c.layout === 'asset' && c.qr_image).length,
+        issues: issueCount,
       },
     });
   } catch (err: any) {
@@ -138,11 +215,7 @@ inventoryRoutes.get('/', requireApiKey, async (_req, res) => {
   }
 });
 
-/**
- * DELETE /inventory/orphan/:data_id?key=<api_key>
- * Thin delete for entries the UI flagged as orphaned. Intentionally generic
- * — the UI decides what's an orphan, the bridge just does the delete.
- */
+/** DELETE /inventory/orphan/:data_id — generic delete for orphaned entries. */
 inventoryRoutes.delete('/orphan/:data_id', requireApiKey, async (req, res) => {
   try {
     const { auth, domainId } = await BridgeAuth.getDomainAuth();

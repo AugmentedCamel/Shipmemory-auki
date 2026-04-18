@@ -1,15 +1,18 @@
 import { Router } from 'express';
 import { requireApiKey } from '../middleware/apiKey.js';
 import { BridgeAuth } from '../services/AukiAuthService.js';
-import { DomainStorageService } from '../services/DomainStorageService.js';
 import { ContextCardSchema } from '../schemas/contextcard.js';
+import { resolveKey, loadCardForResolved } from '../services/DomainLayout.js';
 
 export const resolveRoutes = Router();
 
 /**
  * GET /resolve/:key?key=<api_key>
- * Looks up QR registry by name → loads the linked ContextCard.
- * Single lookup path: qr_registry name === key → card_id → card.
+ *
+ * 1. Look up the registry entry by key (new layout first, legacy fallback).
+ * 2. Load the card from the resolved location.
+ * 3. Inject asset_id into the response so clients can target the asset
+ *    folder for transcript tools.
  */
 resolveRoutes.get('/:key', requireApiKey, async (req, res) => {
   const key = req.params.key;
@@ -18,37 +21,31 @@ resolveRoutes.get('/:key', requireApiKey, async (req, res) => {
   try {
     const { auth, domainId } = await BridgeAuth.getDomainAuth();
 
-    const registryEntries = await DomainStorageService.listByType(auth, domainId, 'qr_registry');
-    console.log(`[resolve] ${registryEntries.length} registry entries, names: [${registryEntries.map((e: any) => e.name).join(', ')}]`);
-
-    const entry = registryEntries.find((e: any) => e.name === key);
-    if (!entry) {
+    const resolved = await resolveKey(auth, domainId, key);
+    if (!resolved) {
       res.status(404).json({ error: `No registry entry for key: ${key}` });
       return;
     }
 
-    const regRaw = await DomainStorageService.load(auth, domainId, entry.id || entry.data_id);
-    const registry = JSON.parse(regRaw.buffer.toString('utf-8'));
-    console.log(`[resolve] registry -> card_id=${registry.card_id}`);
-
-    if (!registry.card_id) {
-      res.status(404).json({ error: 'Registry entry missing card_id' });
+    const loaded = await loadCardForResolved(auth, domainId, resolved);
+    if (!loaded) {
+      res.status(404).json({ error: 'Registry found but card is missing in the asset folder' });
       return;
     }
 
-    const cardRaw = await DomainStorageService.load(auth, domainId, registry.card_id);
-    const card = JSON.parse(cardRaw.buffer.toString('utf-8'));
-    const result = ContextCardSchema.safeParse(card);
-    if (!result.success) {
-      console.log(`[resolve] Card validation failed:`, result.error.issues);
-      res.status(422).json({ error: 'Invalid ContextCard on domain', issues: result.error.issues });
+    const validation = ContextCardSchema.safeParse(loaded.card);
+    if (!validation.success) {
+      console.log('[resolve] card validation failed:', validation.error.issues);
+      res.status(422).json({ error: 'Invalid ContextCard on domain', issues: validation.error.issues });
       return;
     }
 
-    console.log(`[resolve] OK, returning card (body length=${result.data.body.length})`);
-    res.json(result.data);
+    const assetId = resolved.via === 'registry' ? resolved.asset_id : loaded.card_data_id;
+    const response = { ...validation.data, asset_id: assetId };
+    console.log(`[resolve] OK via=${resolved.via} asset_id=${assetId} body_len=${response.body.length}`);
+    res.json(response);
   } catch (err: any) {
-    console.error('[resolve] Error:', err.message);
+    console.error('[resolve] Error:', err?.message);
     res.status(500).json({ error: 'Resolve failed', detail: err?.message });
   }
 });

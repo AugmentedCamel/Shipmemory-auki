@@ -534,10 +534,22 @@
         const displayName = registryKey || c.name || c.data_id;
         const bodyPreview = body ? body.slice(0, 200) + (body.length > 200 ? '...' : '') : '(no body)';
         const resolveUrl = registryKey ? API + '/resolve/' + encodeURIComponent(registryKey) : null;
-        const issueBadges = (c.issues || []).map(tag => {
+        // Delete target: new-layout cards are removed by asset_id (wipes the whole folder),
+        // legacy cards still go by card data_id.
+        const deleteTarget = c.layout === 'asset' ? c.asset_id : c.data_id;
+
+        const badges = [];
+        if (c.layout === 'legacy') {
+          badges.push(`<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-300 border border-blue-800">legacy</span>`);
+        }
+        for (const tag of (c.issues || [])) {
           const label = tag.replace(/_/g, ' ');
-          return `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-800">${esc(label)}</span>`;
-        }).join(' ');
+          badges.push(`<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-800">${esc(label)}</span>`);
+        }
+        if (c.transcript_entries != null && c.transcript_entries > 0) {
+          const sessions = c.session_count || 0;
+          badges.push(`<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-700 text-gray-300 border border-gray-600">${c.transcript_entries} turn${c.transcript_entries === 1 ? '' : 's'} · ${sessions} session${sessions === 1 ? '' : 's'}</span>`);
+        }
 
         row.innerHTML = `
           <div class="flex gap-4">
@@ -553,10 +565,10 @@
                 <div>
                   <h3 class="font-medium text-base">${esc(displayName)}</h3>
                   ${registryKey ? `<p class="text-xs text-green-500 font-mono mb-1">/resolve/${esc(registryKey)}</p>` : ''}
-                  <p class="text-xs text-gray-500 font-mono mb-2">${esc(c.data_id)}</p>
-                  ${issueBadges ? `<div class="flex gap-1 mb-2 flex-wrap">${issueBadges}</div>` : ''}
+                  ${c.asset_id ? `<p class="text-xs text-gray-500 font-mono mb-1">asset ${esc(c.asset_id)}</p>` : ''}
+                  ${badges.length ? `<div class="flex gap-1 mb-2 flex-wrap">${badges.join(' ')}</div>` : ''}
                 </div>
-                <button onclick="deleteCard('${esc(c.data_id)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
+                <button onclick="deleteCard('${esc(deleteTarget)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
               </div>
               <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
               ${tools.length > 0 ? `<p class="text-xs text-gray-500">${tools.length} tool${tools.length > 1 ? 's' : ''}: ${esc(tools.map(t => t.name).join(', '))}</p>` : ''}
@@ -579,15 +591,21 @@
         return;
       }
       const rows = [];
+      const REASONS = {
+        card_missing: 'Points at a card that no longer exists',
+        no_card_id: 'Missing card_id field',
+        no_asset_id: 'Missing asset_id field',
+        asset_missing_card: 'Asset folder has no card file',
+        unreadable: 'Registry entry is unreadable',
+      };
       for (const r of registries) {
-        const reasonLabel = r.reason === 'card_missing'
-          ? 'Points at a card that no longer exists'
-          : 'Missing card_id field';
+        const reasonLabel = REASONS[r.reason] || r.reason || 'Unknown';
+        const typeLabel = r.layout === 'asset' ? 'registry' : 'qr_registry';
         rows.push(`
           <div class="p-3 bg-gray-900 rounded border border-gray-800 flex items-center justify-between gap-3">
             <div class="min-w-0">
               <div class="flex items-center gap-2 mb-1">
-                <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 border border-gray-700">qr_registry</span>
+                <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 border border-gray-700">${esc(typeLabel)}</span>
                 <span class="text-sm font-medium">${esc(r.key || r.name || r.data_id)}</span>
               </div>
               <p class="text-xs text-gray-500">${esc(reasonLabel)}</p>
