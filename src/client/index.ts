@@ -16,6 +16,7 @@ export const streamState: {
 
 class ShipMemoryApp extends AppServer {
   private orchestrators = new Map<string, SessionOrchestrator>();
+  private startedSessions = new Set<string>();
 
   constructor() {
     super({
@@ -39,6 +40,47 @@ class ShipMemoryApp extends AppServer {
         status: streamState.status,
         frameCount: streamState.frameCount,
         iframeUrl: streamState.previewUrl,
+      });
+    });
+
+    // Session state for the webview — lets the UI show a Start button
+    // until the user explicitly triggers orchestrator.start().
+    express.get('/api/state', (_req, res) => {
+      const sessionId = this.orchestrators.keys().next().value ?? null;
+      res.json({
+        sessionId,
+        hasSession: !!sessionId,
+        started: sessionId ? this.startedSessions.has(sessionId) : false,
+        streamStatus: streamState.status,
+      });
+    });
+
+    // Manual start trigger. Until the user POSTs here, the orchestrator
+    // exists but hasn't touched camera / stream / WHEP. This lets the
+    // user wait out any switching_clouds churn before committing
+    // resources.
+    express.post('/api/start', (_req, res) => {
+      const sessionId = this.orchestrators.keys().next().value ?? null;
+      if (!sessionId) {
+        res.status(404).json({ error: 'No active session. Open the app on your glasses first.' });
+        return;
+      }
+      if (this.startedSessions.has(sessionId)) {
+        res.json({ status: 'already-started', sessionId });
+        return;
+      }
+      const orchestrator = this.orchestrators.get(sessionId);
+      if (!orchestrator) {
+        res.status(404).json({ error: 'Orchestrator missing for session' });
+        return;
+      }
+      this.startedSessions.add(sessionId);
+      console.log(`[ShipMemory] User triggered start via webview for ${sessionId}`);
+      res.json({ status: 'starting', sessionId });
+      // Fire-and-forget. Errors get caught and run cleanupSession.
+      orchestrator.start().catch((err) => {
+        console.error(`[ShipMemory] orchestrator.start() failed for ${sessionId} — cleaning up`, err);
+        this.cleanupSession(sessionId, 'start-failed');
       });
     });
 
@@ -80,10 +122,11 @@ class ShipMemoryApp extends AppServer {
       this.orchestrators.delete(sessionId);
     }
 
-    session.layouts.showTextWall('ShipMemory starting…');
+    session.layouts.showTextWall('Open the webview and tap Start');
 
     const orchestrator = new SessionOrchestrator(session, sessionId, env);
     this.orchestrators.set(sessionId, orchestrator);
+    this.startedSessions.delete(sessionId);
 
     // Identity-match guard: onDisconnected can fire LATE for an old session
     // whose sessionId was already reused by a new orchestrator (Mentra
@@ -105,17 +148,12 @@ class ShipMemoryApp extends AppServer {
       console.error(`[ShipMemory] Session error: ${sessionId}`, err instanceof Error ? err.message : err);
     });
 
-    // If start() throws (e.g. QR scan timeout), the SDK logs "Failed to connect"
-    // but doesn't disconnect the WebSocket or know about our orchestrator.
-    // Without this catch, WHEP keeps pulling frames and the Cloudflare stream
-    // leaks forever.
-    try {
-      await orchestrator.start();
-    } catch (err) {
-      console.error(`[ShipMemory] orchestrator.start() failed for ${sessionId} — cleaning up`, err);
-      this.cleanupSession(sessionId, 'start-failed');
-      throw err;
-    }
+    // Don't auto-start. The orchestrator is created and wired, but camera /
+    // WHEP / Gemini stay dormant until the user taps Start in the webview.
+    // That way Mentra's switching_clouds churn (duplicate session_request
+    // webhooks that tear down and recreate the session) can settle without
+    // burning any Cloudflare streams.
+    console.log(`[ShipMemory] Session ${sessionId} ready — waiting for user to tap Start in webview`);
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string): Promise<void> {
@@ -137,6 +175,7 @@ class ShipMemoryApp extends AppServer {
       orchestrator.destroy(trigger);
       this.orchestrators.delete(sessionId);
     }
+    this.startedSessions.delete(sessionId);
     streamState.hlsUrl = null;
     streamState.webrtcUrl = null;
     streamState.previewUrl = null;
@@ -262,10 +301,18 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id="status">
+  <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
+    <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
+    <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600;">Start</button>
+    <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:320px; line-height:1.4;">
+      Tap Start when you're ready to scan a QR code. The camera stays off until you do — no stream restart loop.
+    </div>
+  </div>
+
+  <div id="status" style="display:none;">
     <p>Starting up livestream<span class="dot"> ...</span></p>
   </div>
-  <div id="player">
+  <div id="player" style="display:none;">
     <video id="video" autoplay muted playsinline></video>
   </div>
   <div id="iframe-player" style="display:none; width:100%; height:100%;">
@@ -274,6 +321,10 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
   <pre id="log" style="position:fixed; bottom:0; left:0; right:0; max-height:30vh; overflow-y:auto; background:rgba(0,0,0,0.85); color:#0f0; font-size:0.75rem; padding:8px; z-index:100;"></pre>
 
   <script>
+    const gateEl = document.getElementById('gate');
+    const gateStatusEl = document.getElementById('gate-status');
+    const startBtn = document.getElementById('start-btn');
+    const gateHintEl = document.getElementById('gate-hint');
     const statusEl = document.getElementById('status');
     const playerEl = document.getElementById('player');
     const videoEl = document.getElementById('video');
@@ -281,6 +332,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const previewIframe = document.getElementById('preview-iframe');
     const logEl = document.getElementById('log');
     let started = false;
+    let streamAttached = false;
 
     function log(msg) {
       console.log(msg);
@@ -288,14 +340,61 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       logEl.scrollTop = logEl.scrollHeight;
     }
 
+    async function pollGate() {
+      try {
+        const res = await fetch('/api/state');
+        const s = await res.json();
+        if (!s.hasSession) {
+          gateStatusEl.textContent = 'Waiting for glasses session — open the app on your glasses.';
+          startBtn.style.display = 'none';
+          gateHintEl.style.display = 'none';
+        } else if (!s.started) {
+          gateStatusEl.textContent = 'Ready. Hold the QR steady before you tap Start.';
+          startBtn.style.display = 'inline-block';
+          gateHintEl.style.display = 'block';
+        } else {
+          // User tapped Start — hide the gate, show the player flow
+          gateEl.style.display = 'none';
+          statusEl.style.display = 'block';
+          if (!started) {
+            started = true;
+            poll();
+          }
+          return;
+        }
+      } catch (e) {
+        gateStatusEl.textContent = 'Connection error: ' + e;
+      }
+      setTimeout(pollGate, 1000);
+    }
+
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      gateStatusEl.textContent = 'Starting…';
+      try {
+        const res = await fetch('/api/start', { method: 'POST' });
+        const body = await res.json();
+        log('Start response: ' + JSON.stringify(body));
+        if (!res.ok) {
+          startBtn.disabled = false;
+          gateStatusEl.textContent = body.error || 'Start failed';
+        }
+      } catch (e) {
+        startBtn.disabled = false;
+        gateStatusEl.textContent = 'Start error: ' + e;
+      }
+    });
+
+    pollGate();
+
     async function poll() {
       try {
         const res = await fetch('/api/stream');
         const data = await res.json();
         log('Poll: status=' + data.status + ' webrtc=' + !!data.webrtcUrl + ' iframe=' + !!data.iframeUrl);
 
-        if (data.status === 'active' && !started) {
-          started = true;
+        if (data.status === 'active' && !streamAttached) {
+          streamAttached = true;
 
           // Try WebRTC WHEP first (low latency, we can extract frames)
           // Fall back to Cloudflare iframe preview
@@ -314,7 +413,7 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         }
       } catch (e) { log('Poll error: ' + e); }
 
-      if (!started) setTimeout(poll, 2000);
+      if (!streamAttached) setTimeout(poll, 2000);
     }
 
     async function tryWebRTC(whepUrl) {
