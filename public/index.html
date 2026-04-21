@@ -36,6 +36,49 @@
     </div>
   </div>
 
+  <!-- Edit Card Body Modal -->
+  <div id="edit-body-modal" class="hidden fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4" onclick="closeEditBody(event)">
+    <div class="relative bg-gray-900 rounded-lg p-6 max-w-2xl w-full" onclick="event.stopPropagation()">
+      <button onclick="closeEditBody()" class="absolute top-3 right-3 text-gray-400 hover:text-white text-xl">&times;</button>
+      <h2 class="text-lg font-bold mb-1">Edit card body — <span id="edit-body-key" class="text-gray-400 font-mono text-sm"></span></h2>
+      <p class="text-xs text-gray-500 font-mono mb-3" id="edit-body-asset"></p>
+      <textarea id="edit-body-textarea" rows="12" class="w-full p-3 bg-gray-800 rounded border border-gray-700 text-sm font-mono"></textarea>
+      <details id="edit-body-tools-wrap" class="hidden mt-3">
+        <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-200">Attached tools — mention them in the body so the agent uses them</summary>
+        <div id="edit-body-tools-list" class="mt-2 space-y-1"></div>
+      </details>
+      <p id="edit-body-error" class="text-xs text-red-400 mt-2 hidden"></p>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="closeEditBody()" class="text-xs px-3 py-1.5 rounded border border-gray-700 text-gray-400 hover:text-white">Cancel</button>
+        <button id="edit-body-save" onclick="saveCardBody()" class="text-xs px-3 py-1.5 rounded bg-green-700 hover:bg-green-600">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Attach-tool Reminder Modal -->
+  <div id="attach-reminder-modal" class="hidden fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-4" onclick="closeAttachReminder(event)">
+    <div class="relative bg-gray-900 rounded-lg p-6 max-w-md w-full" onclick="event.stopPropagation()">
+      <button onclick="closeAttachReminder()" class="absolute top-3 right-3 text-gray-400 hover:text-white text-xl">&times;</button>
+      <h2 class="text-base font-bold mb-2">Gemini needs to know about this tool</h2>
+      <p class="text-sm text-gray-300 mb-3">
+        You attached <span id="attach-reminder-tool" class="font-mono text-purple-300"></span> to
+        <span id="attach-reminder-card" class="font-mono text-gray-200"></span>.
+      </p>
+      <p class="text-sm text-gray-400 mb-4">
+        Attaching makes the tool available, but Gemini often won't call a tool unless the card body tells it to.
+        Add a sentence like <em class="text-gray-300">"You have a <code class="bg-gray-800 px-1 rounded">tool_name</code> tool for &lt;what it does&gt;"</em> so the agent actually uses it.
+      </p>
+      <label class="flex items-center gap-2 text-xs text-gray-400 mb-4">
+        <input type="checkbox" id="attach-reminder-dont-show" class="accent-green-600">
+        Don't show this again
+      </label>
+      <div class="flex justify-end gap-2">
+        <button onclick="closeAttachReminder()" class="text-xs px-3 py-1.5 rounded border border-gray-700 text-gray-400 hover:text-white">Got it</button>
+        <button id="attach-reminder-edit-btn" class="text-xs px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500">Edit card body now</button>
+      </div>
+    </div>
+  </div>
+
   <div id="app" class="max-w-2xl mx-auto p-6">
     <!-- =========================== SETUP WIZARD =========================== -->
     <div id="setup-view" class="hidden">
@@ -532,6 +575,9 @@
 
     // Cached presets so the per-card picker can render without a round trip.
     let toolPresetsCache = [];
+    // Cached inventory so the Edit-body modal can read the current body
+    // without a second network round trip.
+    let lastInventory = null;
 
     async function loadInventory() {
       const cardsEl = document.getElementById('cards-list');
@@ -544,6 +590,7 @@
           apiFetch('/api/tools').catch(() => null),
         ]);
         const inv = await invResp.json();
+        lastInventory = inv;
         if (toolsResp) {
           const tj = await toolsResp.json();
           toolPresetsCache = tj.presets || [];
@@ -751,10 +798,20 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ tool_refs: nextRefs }),
         });
+        const justAttached = !was;
+        const justAttachedCard = attachTarget ? {
+          assetId: attachTarget.assetId,
+          displayName: attachTarget.displayName,
+        } : null;
         attachTarget.currentRefs = nextRefs;
         renderAttachList();
         // Refresh the card list in the background so the chips update.
         loadInventory();
+        // Nudge the user to mention the tool in the card body — only on a
+        // fresh attach, and only if they haven't dismissed this permanently.
+        if (justAttached && justAttachedCard && !localStorage.getItem('sm_hide_attach_reminder')) {
+          openAttachReminder(presetName, justAttachedCard.assetId, justAttachedCard.displayName);
+        }
       } catch (err) {
         alert('Update failed: ' + err.message);
       }
@@ -837,7 +894,10 @@
                   ${c.asset_id ? `<p class="text-xs text-gray-500 font-mono mb-1">asset ${esc(c.asset_id)}</p>` : ''}
                   ${badges.length ? `<div class="flex gap-1 mb-2 flex-wrap">${badges.join(' ')}</div>` : ''}
                 </div>
-                <button onclick="deleteCard('${esc(deleteTarget)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
+                <div class="shrink-0 ml-2 flex items-center gap-3">
+                  ${canEditTools ? `<button onclick="editCardBody('${esc(c.asset_id)}')" class="text-xs text-blue-400 hover:text-blue-300">Edit</button>` : ''}
+                  <button onclick="deleteCard('${esc(deleteTarget)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300">Delete</button>
+                </div>
               </div>
               <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
               ${executeUrl ? `<p class="text-xs text-gray-500 font-mono truncate mt-1">${esc(executeUrl)}</p>` : ''}
@@ -956,6 +1016,115 @@
       } catch (err) {
         alert('Delete failed: ' + err.message);
       }
+    }
+
+    // ==================== EDIT CARD BODY ====================
+    let editBodyTarget = null; // { assetId, key }
+
+    function editCardBody(assetId, opts) {
+      if (!lastInventory) {
+        alert('Inventory not loaded yet — refresh and try again.');
+        return;
+      }
+      const card = (lastInventory.cards || []).find(c => c.asset_id === assetId);
+      if (!card) {
+        alert('Card not found in current inventory.');
+        return;
+      }
+      const key = card.registry?.key || assetId;
+      editBodyTarget = { assetId, key };
+      document.getElementById('edit-body-key').textContent = key;
+      document.getElementById('edit-body-asset').textContent = 'asset ' + assetId;
+      const textarea = document.getElementById('edit-body-textarea');
+      let body = card.card?.body || '';
+      if (opts && opts.appendLine) body = body.replace(/\s+$/, '') + '\n\n' + opts.appendLine;
+      textarea.value = body;
+      document.getElementById('edit-body-error').classList.add('hidden');
+
+      // Render attached tools list so the author knows what to mention.
+      const toolRefs = card.card?.tool_refs || [];
+      const toolsWrap = document.getElementById('edit-body-tools-wrap');
+      const toolsList = document.getElementById('edit-body-tools-list');
+      if (toolRefs.length === 0) {
+        toolsWrap.classList.add('hidden');
+      } else {
+        toolsWrap.classList.remove('hidden');
+        toolsList.innerHTML = toolRefs.map(ref => {
+          const preset = toolPresetsCache.find(p => p.name === ref);
+          const desc = preset?.description ? ` — ${esc(preset.description)}` : '';
+          return `<p class="text-xs text-gray-400"><span class="font-mono text-purple-300">${esc(ref)}</span>${desc}</p>`;
+        }).join('');
+      }
+
+      document.getElementById('edit-body-modal').classList.remove('hidden');
+      // Focus + cursor-to-end so the user can start typing immediately.
+      setTimeout(() => {
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+        textarea.scrollTop = textarea.scrollHeight;
+      }, 0);
+    }
+
+    function closeEditBody(e) {
+      if (e && e.target !== e.currentTarget) return;
+      document.getElementById('edit-body-modal').classList.add('hidden');
+      editBodyTarget = null;
+    }
+
+    async function saveCardBody() {
+      if (!editBodyTarget) return;
+      const errEl = document.getElementById('edit-body-error');
+      errEl.classList.add('hidden');
+      const newBody = document.getElementById('edit-body-textarea').value.trim();
+      if (!newBody) {
+        errEl.textContent = 'Body cannot be empty.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      const btn = document.getElementById('edit-body-save');
+      btn.disabled = true;
+      btn.textContent = 'Saving...';
+      try {
+        await apiFetch('/deploy/' + encodeURIComponent(editBodyTarget.assetId), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: newBody }),
+        });
+        closeEditBody();
+        loadInventory();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save';
+      }
+    }
+
+    // ==================== ATTACH REMINDER ====================
+    function openAttachReminder(presetName, assetId, cardLabel) {
+      document.getElementById('attach-reminder-tool').textContent = presetName;
+      document.getElementById('attach-reminder-card').textContent = cardLabel;
+      document.getElementById('attach-reminder-dont-show').checked = false;
+      const editBtn = document.getElementById('attach-reminder-edit-btn');
+      // Rewire every open so we capture the current preset/card in closure.
+      editBtn.onclick = () => {
+        const preset = toolPresetsCache.find(p => p.name === presetName);
+        const suggestion = preset
+          ? `You have a \`${presetName}\` tool: ${preset.description || ''}`.trim()
+          : `You have a \`${presetName}\` tool available.`;
+        closeAttachReminder();
+        editCardBody(assetId, { appendLine: suggestion });
+      };
+      document.getElementById('attach-reminder-modal').classList.remove('hidden');
+    }
+
+    function closeAttachReminder(e) {
+      if (e && e.target !== e.currentTarget) return;
+      if (document.getElementById('attach-reminder-dont-show').checked) {
+        localStorage.setItem('sm_hide_attach_reminder', '1');
+      }
+      document.getElementById('attach-reminder-modal').classList.add('hidden');
     }
 
     // ==================== QR MODAL ====================
