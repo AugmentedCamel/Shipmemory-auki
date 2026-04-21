@@ -139,39 +139,60 @@ deployRoutes.put('/:asset_id', requireApiKey, async (req, res) => {
   try {
     const { auth: domainAuth, domainId } = await BridgeAuth.getDomainAuth();
     const assetId = req.params.asset_id;
-    const { body, tools, tool_refs, execute_url } = req.body;
+    const incoming = req.body || {};
 
-    if (!body) {
-      res.status(400).json({ error: 'body required' });
+    const folder = assetType(assetId);
+    const items = await DomainStorageService.listByType(domainAuth, domainId, folder);
+    const expectedName = cardNameFor(assetId);
+    const existingCardItem = items.find((i: DomainItem) => i.name === expectedName);
+    if (!existingCardItem || !idOf(existingCardItem)) {
+      res.status(404).json({ error: 'No card for asset_id — use POST /deploy to create it' });
       return;
     }
-    const card: Record<string, unknown> = {
-      body,
-      ...(tools ? { tools } : {}),
-      ...(Array.isArray(tool_refs) && tool_refs.length > 0 ? { tool_refs } : {}),
-      ...(execute_url ? { execute_url } : {}),
+
+    // Load existing card so we can patch fields instead of demanding a full body.
+    let existing: Record<string, unknown> = {};
+    try {
+      const raw = await DomainStorageService.load(domainAuth, domainId, idOf(existingCardItem)!);
+      existing = JSON.parse(raw.buffer.toString('utf-8'));
+    } catch (e: any) {
+      res.status(500).json({ error: 'Could not read existing card', detail: e?.message });
+      return;
+    }
+
+    // Patch: each field defaults to the existing value when not provided.
+    // `tool_refs` and `tools` with an empty array explicitly clear the field.
+    const merged: Record<string, unknown> = {
+      body: typeof incoming.body === 'string' ? incoming.body : existing.body,
+      ...(Array.isArray(incoming.tools)
+        ? (incoming.tools.length > 0 ? { tools: incoming.tools } : {})
+        : (Array.isArray(existing.tools) && existing.tools.length > 0 ? { tools: existing.tools } : {})),
+      ...(Array.isArray(incoming.tool_refs)
+        ? (incoming.tool_refs.length > 0 ? { tool_refs: incoming.tool_refs } : {})
+        : (Array.isArray(existing.tool_refs) && existing.tool_refs.length > 0
+            ? { tool_refs: existing.tool_refs }
+            : {})),
+      ...(typeof incoming.execute_url === 'string'
+        ? (incoming.execute_url.length > 0 ? { execute_url: incoming.execute_url } : {})
+        : (typeof existing.execute_url === 'string' && existing.execute_url.length > 0
+            ? { execute_url: existing.execute_url }
+            : {})),
     };
-    const validation = ContextCardSchema.safeParse(card);
+
+    const validation = ContextCardSchema.safeParse(merged);
     if (!validation.success) {
       res.status(422).json({ error: 'Invalid ContextCard', issues: validation.error.issues });
       return;
     }
 
-    const folder = assetType(assetId);
-    const items = await DomainStorageService.listByType(domainAuth, domainId, folder);
-    const expectedName = cardNameFor(assetId);
-    const existingCard = items.find((i: DomainItem) => i.name === expectedName);
-
     // Replace strategy: delete the old card first to free the unique name,
     // then write the new one. If the delete fails we surface it so the
     // caller doesn't think the update landed.
-    if (existingCard && idOf(existingCard)) {
-      try {
-        await DomainStorageService.delete(domainAuth, domainId, idOf(existingCard)!);
-      } catch (e: any) {
-        res.status(500).json({ error: 'Could not replace card', detail: e?.message });
-        return;
-      }
+    try {
+      await DomainStorageService.delete(domainAuth, domainId, idOf(existingCardItem)!);
+    } catch (e: any) {
+      res.status(500).json({ error: 'Could not replace card', detail: e?.message });
+      return;
     }
 
     const newCardDataId = await DomainStorageService.store(

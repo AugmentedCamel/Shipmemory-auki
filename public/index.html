@@ -222,6 +222,9 @@
           <button type="button" data-tab="cards" class="inv-tab px-3 py-1.5 rounded bg-gray-800 border border-gray-700">
             Context Cards <span id="tab-count-cards" class="text-gray-500"></span>
           </button>
+          <button type="button" data-tab="tools" class="inv-tab px-3 py-1.5 rounded bg-gray-900 border border-gray-800 text-gray-400 hover:text-white">
+            Tools <span id="tab-count-tools" class="text-gray-500"></span>
+          </button>
           <button type="button" data-tab="orphans" class="inv-tab px-3 py-1.5 rounded bg-gray-900 border border-gray-800 text-gray-400 hover:text-white">
             Orphans <span id="tab-count-orphans" class="text-red-400"></span>
           </button>
@@ -235,6 +238,45 @@
         </div>
       </div>
 
+      <div id="tab-tools" class="hidden">
+        <div class="flex justify-between items-start mb-3">
+          <p class="text-xs text-gray-500 max-w-xl">
+            Tools Gemini can call during a live session. Each preset becomes a function the agent sees at resolve time.
+            Attach a preset to a card from the card's <span class="text-gray-300">Tools</span> panel.
+            <a href="https://github.com/AugmentedCamel/Shipmemory-auki/blob/main/PROTOCOL.md" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 underline">Protocol reference →</a>
+          </p>
+          <button id="tool-create-btn" class="text-xs px-2 py-1 rounded bg-green-700 hover:bg-green-600">+ Custom tool</button>
+        </div>
+
+        <!-- Custom tool prompt + paste-JSON panel (hidden by default) -->
+        <div id="tool-create-panel" class="hidden mb-4 p-4 bg-gray-900 rounded border border-gray-800 space-y-3">
+          <div>
+            <p class="text-sm text-gray-300 font-medium mb-1">Step 1 — Ask Claude Code to write the tool</p>
+            <p class="text-xs text-gray-500 mb-2">
+              Describe your tool in plain English. The prompt points Claude at the protocol so it returns a preset JSON ready to paste below.
+            </p>
+            <div class="flex gap-2 items-start">
+              <pre id="tool-claude-prompt" class="flex-1 p-3 bg-gray-950 rounded border border-gray-800 text-xs text-gray-300 whitespace-pre-wrap overflow-x-auto"></pre>
+              <button id="tool-copy-prompt" class="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 shrink-0">Copy</button>
+            </div>
+          </div>
+          <div>
+            <p class="text-sm text-gray-300 font-medium mb-1">Step 2 — Paste the preset JSON</p>
+            <textarea id="tool-paste-json" rows="8" placeholder='{"name": "weather_lookup", "description": "...", "parameters": {...}, "execute_url": "https://..."}'
+              class="w-full p-2 bg-gray-800 rounded border border-gray-700 font-mono text-xs"></textarea>
+            <div class="flex justify-end gap-2 mt-2">
+              <button id="tool-paste-cancel" class="text-xs px-3 py-1 rounded border border-gray-700 text-gray-400 hover:text-white">Cancel</button>
+              <button id="tool-paste-save" class="text-xs px-3 py-1 rounded bg-green-700 hover:bg-green-600">Save preset</button>
+            </div>
+            <p id="tool-paste-error" class="text-xs text-red-400 mt-1 hidden"></p>
+          </div>
+        </div>
+
+        <div id="tools-list" class="space-y-3">
+          <p class="text-gray-500">Loading...</p>
+        </div>
+      </div>
+
       <div id="tab-orphans" class="hidden">
         <p class="text-xs text-gray-500 mb-3">
           Entries on your Auki Domain that no longer belong to a complete card — usually leftovers from failed deploys
@@ -242,6 +284,17 @@
         </p>
         <div id="orphans-list" class="space-y-3">
           <p class="text-gray-500">Loading...</p>
+        </div>
+      </div>
+
+      <!-- Add-tool-to-card picker (modal) -->
+      <div id="attach-tool-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onclick="closeAttachTool(event)">
+        <div class="bg-gray-900 rounded border border-gray-700 max-w-lg w-full max-h-[80vh] overflow-y-auto" onclick="event.stopPropagation()">
+          <div class="p-4 border-b border-gray-800 flex justify-between items-center">
+            <h2 class="text-base font-semibold">Attach tool to <span id="attach-target-label" class="text-gray-400"></span></h2>
+            <button onclick="closeAttachTool()" class="text-gray-500 hover:text-white">✕</button>
+          </div>
+          <div id="attach-tool-list" class="p-4 space-y-2"></div>
         </div>
       </div>
     </div>
@@ -472,8 +525,13 @@
         btn.classList.toggle('text-gray-400', !on);
       });
       document.getElementById('tab-cards').classList.toggle('hidden', name !== 'cards');
+      document.getElementById('tab-tools').classList.toggle('hidden', name !== 'tools');
       document.getElementById('tab-orphans').classList.toggle('hidden', name !== 'orphans');
+      if (name === 'tools') loadTools();
     }
+
+    // Cached presets so the per-card picker can render without a round trip.
+    let toolPresetsCache = [];
 
     async function loadInventory() {
       const cardsEl = document.getElementById('cards-list');
@@ -481,8 +539,18 @@
       cardsEl.innerHTML = '<p class="text-gray-500">Loading...</p>';
       orphEl.innerHTML = '<p class="text-gray-500">Loading...</p>';
       try {
-        const resp = await apiFetch('/inventory');
-        const inv = await resp.json();
+        const [invResp, toolsResp] = await Promise.all([
+          apiFetch('/inventory'),
+          apiFetch('/api/tools').catch(() => null),
+        ]);
+        const inv = await invResp.json();
+        if (toolsResp) {
+          const tj = await toolsResp.json();
+          toolPresetsCache = tj.presets || [];
+          document.getElementById('tab-count-tools').textContent = toolPresetsCache.length
+            ? `(${toolPresetsCache.length})`
+            : '';
+        }
         renderCards(inv.cards || []);
         renderOrphans(inv.orphan_registries || [], inv.orphan_qr_images || []);
         const orphanTotal = (inv.orphan_registries?.length || 0) + (inv.orphan_qr_images?.length || 0);
@@ -491,6 +559,204 @@
       } catch (err) {
         cardsEl.innerHTML = `<p class="text-red-400">${esc(err.message)}</p>`;
         orphEl.innerHTML = '';
+      }
+    }
+
+    // ==================== TOOLS ====================
+    async function loadTools() {
+      const el = document.getElementById('tools-list');
+      el.innerHTML = '<p class="text-gray-500">Loading...</p>';
+      try {
+        const resp = await apiFetch('/api/tools');
+        const { presets } = await resp.json();
+        toolPresetsCache = presets || [];
+        document.getElementById('tab-count-tools').textContent = presets?.length ? `(${presets.length})` : '';
+        renderTools(presets || []);
+      } catch (err) {
+        el.innerHTML = `<p class="text-red-400">${esc(err.message)}</p>`;
+      }
+    }
+
+    function renderTools(presets) {
+      const el = document.getElementById('tools-list');
+      if (presets.length === 0) {
+        el.innerHTML = '<p class="p-4 bg-gray-900 rounded border border-gray-800 text-sm text-gray-400">No tools yet. Built-ins are seeded automatically on bridge startup.</p>';
+        return;
+      }
+      el.innerHTML = '';
+      for (const p of presets) {
+        const row = document.createElement('div');
+        row.className = 'p-4 bg-gray-900 rounded border border-gray-800';
+        const kindBadge = p.builtin
+          ? `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-purple-900/50 text-purple-300 border border-purple-800">built-in</span>`
+          : (p.execute_url
+            ? `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-300 border border-blue-800">custom</span>`
+            : '');
+        const storedBadge = p.stored
+          ? `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 border border-gray-700">on domain</span>`
+          : `<span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 border border-gray-700">virtual</span>`;
+        const paramsJson = JSON.stringify(p.parameters || {}, null, 2);
+        row.innerHTML = `
+          <div class="flex justify-between items-start gap-3">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2 mb-1 flex-wrap">
+                <h3 class="font-mono text-sm text-gray-100">${esc(p.name)}</h3>
+                ${kindBadge}
+                ${storedBadge}
+              </div>
+              <p class="text-sm text-gray-400 mb-2 whitespace-pre-line">${esc(p.description || '')}</p>
+              ${p.execute_url ? `<p class="text-xs text-gray-500 font-mono truncate mb-2">${esc(p.execute_url)}</p>` : ''}
+              <details>
+                <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">parameters (JSON Schema)</summary>
+                <pre class="mt-2 p-2 bg-gray-950 rounded border border-gray-800 text-[11px] text-gray-300 overflow-x-auto">${esc(paramsJson)}</pre>
+              </details>
+            </div>
+            <div class="flex flex-col gap-1 shrink-0">
+              ${p.stored ? `<button onclick="deleteTool('${esc(p.name)}')" class="text-xs text-red-400 hover:text-red-300">Delete</button>` : ''}
+            </div>
+          </div>`;
+        el.appendChild(row);
+      }
+    }
+
+    async function deleteTool(name) {
+      const preset = toolPresetsCache.find(p => p.name === name);
+      const isBuiltin = !!preset?.builtin;
+      const confirmMsg = isBuiltin
+        ? `Remove built-in "${name}" from the domain? It will re-seed on the next bridge restart.`
+        : `Delete tool "${name}"?`;
+      if (!confirm(confirmMsg)) return;
+      try {
+        await apiFetch('/api/tools/' + encodeURIComponent(name), { method: 'DELETE' });
+        loadTools();
+      } catch (err) {
+        alert('Delete failed: ' + err.message);
+      }
+    }
+
+    const CLAUDE_CODE_PROMPT =
+      'Build me a ShipMemory tool following the protocol at\n' +
+      'https://github.com/AugmentedCamel/Shipmemory-auki/blob/main/PROTOCOL.md.\n\n' +
+      'It should <describe what the tool does>.\n' +
+      'Parameters: <list fields and their types>.\n' +
+      'It will be called at <my server URL> using the POST `{tool, params}`\n' +
+      'contract from §3.\n\n' +
+      'Return just the preset JSON with `name`, `description`, `parameters`,\n' +
+      'and `execute_url` — I\'ll paste it into the bridge UI.';
+
+    function openToolCreate() {
+      document.getElementById('tool-claude-prompt').textContent = CLAUDE_CODE_PROMPT;
+      document.getElementById('tool-paste-json').value = '';
+      document.getElementById('tool-paste-error').classList.add('hidden');
+      document.getElementById('tool-create-panel').classList.remove('hidden');
+    }
+
+    function closeToolCreate() {
+      document.getElementById('tool-create-panel').classList.add('hidden');
+    }
+
+    async function saveToolFromPaste() {
+      const textarea = document.getElementById('tool-paste-json');
+      const errEl = document.getElementById('tool-paste-error');
+      errEl.classList.add('hidden');
+      let parsed;
+      try {
+        parsed = JSON.parse(textarea.value);
+      } catch (e) {
+        errEl.textContent = 'Invalid JSON: ' + e.message;
+        errEl.classList.remove('hidden');
+        return;
+      }
+      if (!parsed.name || !parsed.description || !parsed.parameters) {
+        errEl.textContent = 'Missing required fields (name, description, parameters).';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      try {
+        await apiFetch('/api/tools', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(parsed),
+        });
+        closeToolCreate();
+        loadTools();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      }
+    }
+
+    async function copyClaudePrompt() {
+      try {
+        await navigator.clipboard.writeText(CLAUDE_CODE_PROMPT);
+        const btn = document.getElementById('tool-copy-prompt');
+        const prev = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+      } catch {
+        alert('Clipboard unavailable — select and copy manually.');
+      }
+    }
+
+    // ==================== ATTACH-TOOL MODAL ====================
+    let attachTarget = null;  // { assetId, currentRefs: [...], displayName }
+
+    function openAttachTool(assetId, displayName, currentRefs) {
+      attachTarget = { assetId, displayName, currentRefs: currentRefs || [] };
+      document.getElementById('attach-target-label').textContent = displayName;
+      renderAttachList();
+      document.getElementById('attach-tool-modal').classList.remove('hidden');
+    }
+
+    function closeAttachTool(e) {
+      if (e && e.target !== e.currentTarget) return;
+      document.getElementById('attach-tool-modal').classList.add('hidden');
+      attachTarget = null;
+    }
+
+    function renderAttachList() {
+      const el = document.getElementById('attach-tool-list');
+      if (toolPresetsCache.length === 0) {
+        el.innerHTML = '<p class="text-sm text-gray-400">No presets available — create one from the Tools tab first.</p>';
+        return;
+      }
+      el.innerHTML = '';
+      for (const p of toolPresetsCache) {
+        const attached = attachTarget.currentRefs.includes(p.name);
+        const row = document.createElement('div');
+        row.className = 'p-3 bg-gray-800 rounded border border-gray-700 flex items-center justify-between gap-3';
+        row.innerHTML = `
+          <div class="min-w-0">
+            <p class="font-mono text-sm">${esc(p.name)}</p>
+            <p class="text-xs text-gray-500 truncate">${esc(p.description || '')}</p>
+          </div>
+          <button class="text-xs px-2 py-1 rounded shrink-0 ${attached ? 'bg-red-900/40 text-red-300 hover:bg-red-900/60' : 'bg-green-700 hover:bg-green-600'}"
+            data-name="${esc(p.name)}" data-attached="${attached ? '1' : '0'}">
+            ${attached ? 'Remove' : 'Attach'}
+          </button>`;
+        row.querySelector('button').addEventListener('click', () => toggleAttachTool(p.name));
+        el.appendChild(row);
+      }
+    }
+
+    async function toggleAttachTool(presetName) {
+      if (!attachTarget) return;
+      const was = attachTarget.currentRefs.includes(presetName);
+      const nextRefs = was
+        ? attachTarget.currentRefs.filter(n => n !== presetName)
+        : [...attachTarget.currentRefs, presetName];
+      try {
+        await apiFetch('/deploy/' + encodeURIComponent(attachTarget.assetId), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tool_refs: nextRefs }),
+        });
+        attachTarget.currentRefs = nextRefs;
+        renderAttachList();
+        // Refresh the card list in the background so the chips update.
+        loadInventory();
+      } catch (err) {
+        alert('Update failed: ' + err.message);
       }
     }
 
@@ -529,6 +795,7 @@
 
         const body = c.card?.body || '';
         const tools = c.card?.tools || [];
+        const toolRefs = c.card?.tool_refs || [];
         const executeUrl = c.card?.execute_url || null;
         const registryKey = c.registry?.key || null;
         const displayName = registryKey || c.name || c.data_id;
@@ -537,6 +804,8 @@
         // Delete target: new-layout cards are removed by asset_id (wipes the whole folder),
         // legacy cards still go by card data_id.
         const deleteTarget = c.layout === 'asset' ? c.asset_id : c.data_id;
+        const canEditTools = c.layout === 'asset' && !!c.asset_id;
+        const toolCountLabel = tools.length + toolRefs.length;
 
         const badges = [];
         if (c.layout === 'legacy') {
@@ -571,8 +840,27 @@
                 <button onclick="deleteCard('${esc(deleteTarget)}', '${esc(displayName)}')" class="text-xs text-red-400 hover:text-red-300 shrink-0 ml-2">Delete</button>
               </div>
               <p class="text-sm text-gray-400 mb-1 whitespace-pre-line">${esc(bodyPreview)}</p>
-              ${tools.length > 0 ? `<p class="text-xs text-gray-500">${tools.length} tool${tools.length > 1 ? 's' : ''}: ${esc(tools.map(t => t.name).join(', '))}</p>` : ''}
               ${executeUrl ? `<p class="text-xs text-gray-500 font-mono truncate mt-1">${esc(executeUrl)}</p>` : ''}
+              <details class="mt-2 card-tools-details">
+                <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-200">Tools (${toolCountLabel})</summary>
+                <div class="mt-2 space-y-2">
+                  ${toolRefs.length === 0 && tools.length === 0
+                    ? `<p class="text-xs text-gray-500">No tools attached yet.</p>`
+                    : ''}
+                  ${toolRefs.length > 0 ? `
+                    <div class="flex flex-wrap gap-1">
+                      ${toolRefs.map(ref => `
+                        <span class="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-purple-900/40 text-purple-200 border border-purple-800">
+                          <span class="font-mono">${esc(ref)}</span>
+                          ${canEditTools ? `<button class="tool-chip-remove text-purple-300 hover:text-white" data-asset-id="${esc(c.asset_id)}" data-ref="${esc(ref)}" title="Detach">×</button>` : ''}
+                        </span>`).join('')}
+                    </div>` : ''}
+                  ${tools.length > 0 ? `
+                    <p class="text-xs text-gray-500">Inline: ${esc(tools.map(t => t.name).join(', '))}</p>` : ''}
+                  ${canEditTools ? `
+                    <button class="tool-add-btn text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600" data-asset-id="${esc(c.asset_id)}" data-name="${esc(displayName)}" data-refs="${esc(JSON.stringify(toolRefs))}">+ Add tool</button>` : ''}
+                </div>
+              </details>
             </div>
           </div>
         `;
@@ -699,7 +987,53 @@
     document.querySelectorAll('.inv-tab').forEach(btn => {
       btn.addEventListener('click', () => setInvTab(btn.dataset.tab));
     });
-    document.getElementById('inventory-refresh').addEventListener('click', loadInventory);
+    document.getElementById('inventory-refresh').addEventListener('click', () => {
+      loadInventory();
+      if (activeInvTab === 'tools') loadTools();
+    });
+    document.getElementById('tool-create-btn').addEventListener('click', openToolCreate);
+    document.getElementById('tool-paste-cancel').addEventListener('click', closeToolCreate);
+    document.getElementById('tool-paste-save').addEventListener('click', saveToolFromPaste);
+    document.getElementById('tool-copy-prompt').addEventListener('click', copyClaudePrompt);
+
+    // Event delegation for per-card tool controls (buttons are recreated on each render).
+    document.getElementById('cards-list').addEventListener('click', (e) => {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+
+      const addBtn = target.closest('.tool-add-btn');
+      if (addBtn) {
+        const assetId = addBtn.getAttribute('data-asset-id');
+        const name = addBtn.getAttribute('data-name');
+        const refs = JSON.parse(addBtn.getAttribute('data-refs') || '[]');
+        openAttachTool(assetId, name, refs);
+        return;
+      }
+
+      const chipX = target.closest('.tool-chip-remove');
+      if (chipX) {
+        const assetId = chipX.getAttribute('data-asset-id');
+        const ref = chipX.getAttribute('data-ref');
+        detachToolFromCard(assetId, ref);
+      }
+    });
+
+    async function detachToolFromCard(assetId, ref) {
+      // Find current refs from inventory-rendered data-refs on the nearby button.
+      const addBtn = document.querySelector(`.tool-add-btn[data-asset-id="${assetId}"]`);
+      const current = addBtn ? JSON.parse(addBtn.getAttribute('data-refs') || '[]') : [];
+      const nextRefs = current.filter(n => n !== ref);
+      try {
+        await apiFetch('/deploy/' + encodeURIComponent(assetId), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tool_refs: nextRefs }),
+        });
+        loadInventory();
+      } catch (err) {
+        alert('Detach failed: ' + err.message);
+      }
+    }
 
     async function openSettings() {
       const modal = document.getElementById('settings-modal');

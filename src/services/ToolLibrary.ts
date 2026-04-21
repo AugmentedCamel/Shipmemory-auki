@@ -126,6 +126,42 @@ export const ToolLibrary = {
   },
 
   /**
+   * Save (create or overwrite) a preset. If a preset with this name already
+   * exists on the domain, the old entry is deleted first — the Auki domain
+   * requires domain-wide unique names, so overwrite = delete + store.
+   */
+  async savePreset(auth: DomainAuth, domainId: string, preset: ToolPreset): Promise<void> {
+    if (!preset.name || typeof preset.name !== 'string') throw new Error('preset.name required');
+    const items = await DomainStorageService.listByType(auth, domainId, TOOL_PRESET_TYPE);
+    const existing = items.find((i: DomainItem) => i.name === preset.name);
+    if (existing && idOf(existing)) {
+      try {
+        await DomainStorageService.delete(auth, domainId, idOf(existing)!);
+      } catch (err: any) {
+        throw new Error(`Could not replace preset "${preset.name}": ${err?.message}`);
+      }
+    }
+    await DomainStorageService.store(auth, domainId, JSON.stringify(preset), {
+      name: preset.name,
+      dataType: TOOL_PRESET_TYPE,
+      contentType: 'application/json',
+    });
+  },
+
+  /**
+   * Delete a preset by name. Returns true if a stored entry was removed,
+   * false if no such entry was on the domain (built-ins that were never
+   * persisted fall into this case — nothing to delete).
+   */
+  async deletePreset(auth: DomainAuth, domainId: string, name: string): Promise<boolean> {
+    const items = await DomainStorageService.listByType(auth, domainId, TOOL_PRESET_TYPE);
+    const existing = items.find((i: DomainItem) => i.name === name);
+    if (!existing || !idOf(existing)) return false;
+    await DomainStorageService.delete(auth, domainId, idOf(existing)!);
+    return true;
+  },
+
+  /**
    * Idempotently write built-in presets to the domain. Safe to call on every
    * boot — it only writes presets whose names don't already exist.
    * No-op when auth isn't ready yet.
