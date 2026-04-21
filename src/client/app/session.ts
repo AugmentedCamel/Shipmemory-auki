@@ -362,21 +362,32 @@ export class SessionOrchestrator {
     const url = new URL(this.card!.execute_url!);
     if (this.config.BRIDGE_API_KEY) url.searchParams.set('key', this.config.BRIDGE_API_KEY);
 
+    const body = {
+      tool: call.name,
+      params: { ...(call.args ?? {}), session_id: this.sessionId },
+    };
+    // Log the destination without the key — so we can verify the URL and
+    // see whether the key got appended at all (has_key=true/false).
+    const logUrl = url.origin + url.pathname;
+    const hasKey = url.searchParams.has('key');
+    console.log(`[Tool] POST ${logUrl} has_key=${hasKey} body=${JSON.stringify(body)}`);
+
     const res = await fetch(url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool: call.name,
-        params: { ...(call.args ?? {}), session_id: this.sessionId },
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(TOOL_TIMEOUT_MS),
     });
 
     if (!res.ok) {
-      throw new Error(`Tool API returned ${res.status}: ${await res.text()}`);
+      const errText = await res.text();
+      console.error(`[Tool] ${call.name} -> ${res.status}: ${errText}`);
+      throw new Error(`Tool API returned ${res.status}: ${errText}`);
     }
 
-    return await res.json() as Record<string, unknown>;
+    const json = await res.json() as Record<string, unknown>;
+    console.log(`[Tool] ${call.name} -> 200: ${JSON.stringify(json)}`);
+    return json;
   }
 
   private handleDisconnect(reason?: string): void {

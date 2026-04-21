@@ -15,10 +15,12 @@ export const toolRoutes = Router();
  * card's execute_url at their own dispatcher instead.
  */
 toolRoutes.post('/:asset_id', requireApiKey, async (req, res) => {
+  const assetId = req.params.asset_id;
+  const { tool, params } = req.body || {};
+  console.log(`[tool] asset=${assetId} tool=${tool} params=${JSON.stringify(params)}`);
+
   try {
     const { auth, domainId } = await BridgeAuth.getDomainAuth();
-    const assetId = req.params.asset_id;
-    const { tool, params } = req.body || {};
 
     if (!tool || typeof tool !== 'string') {
       res.status(400).json({ error: 'tool (string) required' });
@@ -33,8 +35,21 @@ toolRoutes.post('/:asset_id', requireApiKey, async (req, res) => {
 
     res.status(404).json({ error: `Unknown built-in tool: ${tool}` });
   } catch (err: any) {
-    console.error('[tool dispatcher]', err?.message);
-    res.status(500).json({ error: 'Dispatch failed', detail: err?.message });
+    const upstreamStatus = err?.response?.status;
+    const upstreamData = err?.response?.data;
+    const upstreamDataStr =
+      Buffer.isBuffer(upstreamData) ? upstreamData.toString('utf-8')
+      : typeof upstreamData === 'object' ? JSON.stringify(upstreamData)
+      : String(upstreamData);
+    console.error(
+      `[tool dispatcher] tool=${tool} asset=${assetId} upstream_status=${upstreamStatus} upstream=${upstreamDataStr} message=${err?.message}`,
+    );
+    res.status(500).json({
+      error: 'Dispatch failed',
+      detail: err?.message,
+      upstream_status: upstreamStatus,
+      upstream: upstreamData,
+    });
   }
 });
 

@@ -41,8 +41,12 @@ export async function appendEntry(
     created_at: new Date().toISOString(),
   };
   const name = sessionNameFor(assetId, sessionId, nextTurn);
+  const payload = JSON.stringify(record);
+  console.log(
+    `[transcript append] data_type="${folder}" name="${name}" name_len=${name.length} payload_bytes=${payload.length}`,
+  );
 
-  const dataId = await DomainStorageService.store(auth, domainId, JSON.stringify(record), {
+  const dataId = await DomainStorageService.store(auth, domainId, payload, {
     name,
     dataType: folder,
     contentType: 'application/json',
