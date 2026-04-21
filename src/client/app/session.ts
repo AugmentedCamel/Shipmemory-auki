@@ -356,13 +356,18 @@ export class SessionOrchestrator {
   }
 
   private async executeTool(call: GeminiFunctionCall): Promise<Record<string, unknown>> {
-    const res = await fetch(this.card!.execute_url!, {
+    // Matches PROTOCOL.md §3: { tool, params }. session_id is injected from
+    // the Mentra sessionId so tools (like session_history) can scope storage
+    // per conversation without having to teach Gemini our session IDs.
+    const url = new URL(this.card!.execute_url!);
+    if (this.config.BRIDGE_API_KEY) url.searchParams.set('key', this.config.BRIDGE_API_KEY);
+
+    const res = await fetch(url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: call.name,
-        arguments: call.args,
-        session_id: this.card!.session_id,
+        tool: call.name,
+        params: { ...(call.args ?? {}), session_id: this.sessionId },
       }),
       signal: AbortSignal.timeout(TOOL_TIMEOUT_MS),
     });
@@ -371,8 +376,7 @@ export class SessionOrchestrator {
       throw new Error(`Tool API returned ${res.status}: ${await res.text()}`);
     }
 
-    const json = await res.json() as Record<string, unknown>;
-    return (json.result as Record<string, unknown>) ?? json;
+    return await res.json() as Record<string, unknown>;
   }
 
   private handleDisconnect(reason?: string): void {
