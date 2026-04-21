@@ -40,26 +40,25 @@ export function cardNameFor(assetId: string): string {
 export function qrNameFor(assetId: string): string {
   return `${assetId}_qr`;
 }
-export function sessionNameFor(assetId: string, sessionId: string, turn: number): string {
-  // Zero-pad so lexical sort == chronological sort in listByType output.
-  return `${assetId}_session_${sessionId}_${String(turn).padStart(6, '0')}`;
-}
+export const SESSION_HISTORY_NAME_PREFIX = 'session_history_';
 
 /**
- * Parse a session entry name back into (sessionId, turn). The assetId is
- * always known at call time (we list by its data_type to find these names),
- * so we strip the asset prefix and match the trailing numeric turn.
+ * Build a domain-safe, globally unique name for a session_history entry.
+ * The Auki domain rejects names containing characters outside a conservative
+ * set, so we keep the name self-generated — no Mentra session_id / user id
+ * leaking in. Timestamp gives chronological sort; random tail avoids
+ * collisions within the same millisecond.
  */
-export function parseSessionName(
-  name: string,
-  assetId: string,
-): { sessionId: string; turn: number } | null {
-  const prefix = `${assetId}_session_`;
-  if (!name.startsWith(prefix)) return null;
-  const rest = name.slice(prefix.length);
-  const m = /^(.+)_(\d+)$/.exec(rest);
-  if (!m) return null;
-  return { sessionId: m[1], turn: parseInt(m[2], 10) };
+export function generateSessionHistoryName(): string {
+  // String(Date.now()) is exactly 13 digits until year 2286 — fixed width
+  // means lexical sort == chronological sort.
+  const ts = String(Date.now()).padStart(13, '0');
+  const rand = Math.random().toString(36).slice(2, 8); // 6 chars, base36
+  return `${SESSION_HISTORY_NAME_PREFIX}${ts}_${rand}`;
+}
+
+export function isSessionHistoryName(name: string): boolean {
+  return name.startsWith(SESSION_HISTORY_NAME_PREFIX);
 }
 
 type DomainItem = { id?: string; data_id?: string; name?: string; [k: string]: unknown };

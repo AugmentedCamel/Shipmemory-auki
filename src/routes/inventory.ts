@@ -8,7 +8,7 @@ import {
   assetType,
   cardNameFor,
   qrNameFor,
-  parseSessionName,
+  isSessionHistoryName,
 } from '../services/DomainLayout.js';
 
 export const inventoryRoutes = Router();
@@ -94,14 +94,13 @@ inventoryRoutes.get('/', requireApiKey, async (_req, res) => {
       }
       if (!qrItem) issues.push('missing_qr');
 
+      // Count session_history entries cheaply by name prefix. Session count
+      // would require loading each entry's payload, so we skip it for
+      // inventory — transcript_entries is enough signal on the card row.
       const sessionTurns = items.filter(
-        (i: DomainItem) => i.name && parseSessionName(i.name, assetId),
+        (i: DomainItem) => i.name && isSessionHistoryName(i.name),
       );
       const sessionIds = new Set<string>();
-      for (const t of sessionTurns) {
-        const p = t.name ? parseSessionName(t.name, assetId) : null;
-        if (p) sessionIds.add(p.sessionId);
-      }
 
       cards.push({
         layout: 'asset',

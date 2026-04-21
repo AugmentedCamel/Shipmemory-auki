@@ -39,7 +39,7 @@ sessionRoutes.post('/:asset_id/transcript', requireApiKey, async (req, res) => {
       content,
       ...(meta ? { meta } : {}),
     });
-    res.status(201).json({ data_id: result.data_id, asset_id: assetId, session_id, turn: result.turn });
+    res.status(201).json({ data_id: result.data_id, asset_id: assetId, session_id });
   } catch (err: any) {
     console.error('[session append]', err?.message);
     res.status(500).json({ error: 'Append failed', detail: err?.message });

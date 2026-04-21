@@ -75,7 +75,7 @@ async function handleSessionHistory(
     const extra: Record<string, unknown> = { kind: 'turn', question, response };
     if (typeof notes === 'string' && notes.length > 0) extra.notes = notes;
     const result = await appendEntry(auth, domainId, assetId, session_id, extra);
-    return { status: 201, body: { ok: true, data_id: result.data_id, turn: result.turn } };
+    return { status: 201, body: { ok: true, data_id: result.data_id } };
   }
 
   if (action === 'read') {
