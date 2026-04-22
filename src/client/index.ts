@@ -1,4 +1,5 @@
 import { AppServer, AppSession } from '@mentra/sdk';
+import { streamSSE } from 'hono/streaming';
 import { EventEmitter } from 'node:events';
 import { env } from './config/env.js';
 import { SessionOrchestrator } from './app/session.js';
@@ -42,11 +43,9 @@ class ShipMemoryApp extends AppServer {
   }
 
   private setupWebviewRoutes(): void {
-    const express = this.getExpressApp();
-
     // Stream status API (polled by the webview page)
-    express.get('/api/stream', (_req, res) => {
-      res.json({
+    this.get('/api/stream', (c) =>
+      c.json({
         hlsUrl: streamState.hlsUrl,
         webrtcUrl: streamState.webrtcUrl,
         previewUrl: streamState.previewUrl,
@@ -54,15 +53,15 @@ class ShipMemoryApp extends AppServer {
         status: streamState.status,
         frameCount: streamState.frameCount,
         iframeUrl: streamState.previewUrl,
-      });
-    });
+      }),
+    );
 
     // Session state for the webview — lets the UI show a Start button
     // until the user explicitly triggers orchestrator.start().
-    express.get('/api/state', (_req, res) => {
+    this.get('/api/state', (c) => {
       const sessionId = this.orchestrators.keys().next().value ?? null;
       const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
-      res.json({
+      return c.json({
         sessionId,
         hasSession: !!sessionId,
         started: sessionId ? this.startedSessions.has(sessionId) : false,
@@ -75,64 +74,66 @@ class ShipMemoryApp extends AppServer {
     // exists but hasn't touched camera / stream / WHEP. This lets the
     // user wait out any switching_clouds churn before committing
     // resources.
-    express.post('/api/start', (_req, res) => {
+    this.post('/api/start', (c) => {
       const sessionId = this.orchestrators.keys().next().value ?? null;
       if (!sessionId) {
-        res.status(404).json({ error: 'No active session. Open the app on your glasses first.' });
-        return;
+        return c.json({ error: 'No active session. Open the app on your glasses first.' }, 404);
       }
       if (this.startedSessions.has(sessionId)) {
-        res.json({ status: 'already-started', sessionId });
-        return;
+        return c.json({ status: 'already-started', sessionId });
       }
       const orchestrator = this.orchestrators.get(sessionId);
       if (!orchestrator) {
-        res.status(404).json({ error: 'Orchestrator missing for session' });
-        return;
+        return c.json({ error: 'Orchestrator missing for session' }, 404);
       }
       this.startedSessions.add(sessionId);
       console.log(`[ShipMemory] User triggered start via webview for ${sessionId}`);
-      res.json({ status: 'starting', sessionId });
       // Fire-and-forget. Errors get caught and run cleanupSession.
       orchestrator.start().catch((err) => {
         console.error(`[ShipMemory] orchestrator.start() failed for ${sessionId} — cleaning up`, err);
         this.cleanupSession(sessionId, 'start-failed');
       });
+      return c.json({ status: 'starting', sessionId });
     });
 
     // SSE stream of Gemini transcription events (user speech + AI reply).
     // No history — subscribers see events from the moment they connect.
-    express.get('/api/transcript/stream', (req, res) => {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.flushHeaders?.();
-      res.write('retry: 2000\n\n');
-      const listener = (ev: unknown) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
-      transcriptEvents.on('event', listener);
-      req.on('close', () => transcriptEvents.off('event', listener));
-    });
+    this.get('/api/transcript/stream', (c) =>
+      streamSSE(c, async (stream) => {
+        await stream.writeSSE({ data: '', retry: 2000 });
+        const listener = (ev: unknown) => {
+          stream.writeSSE({ data: JSON.stringify(ev) }).catch(() => {});
+        };
+        transcriptEvents.on('event', listener);
+        await new Promise<void>((resolve) => {
+          stream.onAbort(() => {
+            transcriptEvents.off('event', listener);
+            resolve();
+          });
+        });
+      }),
+    );
 
     // Latest camera frame as JPEG (for debugging)
-    express.get('/api/frame', (_req, res) => {
+    this.get('/api/frame', (c) => {
       if (!streamState.latestJpeg) {
-        res.status(404).send('No frame available yet');
-        return;
+        return c.text('No frame available yet', 404);
       }
-      res.set('Content-Type', 'image/jpeg');
-      res.set('Cache-Control', 'no-cache, no-store');
-      res.send(streamState.latestJpeg);
+      // Use raw Response — Hono's c.body() typing rejects Node Buffer because
+      // Buffer's ArrayBufferLike includes SharedArrayBuffer.
+      return new Response(new Uint8Array(streamState.latestJpeg), {
+        headers: {
+          'Content-Type': 'image/jpeg',
+          'Cache-Control': 'no-cache, no-store',
+        },
+      });
     });
 
     // Live frame preview page (auto-refreshes)
-    express.get('/frame', (_req, res) => {
-      res.type('html').send(FRAME_PREVIEW_HTML);
-    });
+    this.get('/frame', (c) => c.html(FRAME_PREVIEW_HTML));
 
     // Webview page
-    express.get('/webview', (_req, res) => {
-      res.type('html').send(WEBVIEW_HTML);
-    });
+    this.get('/webview', (c) => c.html(WEBVIEW_HTML));
 
     console.log('[ShipMemory] Routes: /webview (stream), /frame (camera preview), /api/frame (raw JPEG)');
   }
@@ -535,5 +536,14 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 </html>`;
 
 const app = new ShipMemoryApp();
-app.start().catch(console.error);
+await app.start();
+
+// v3 AppServer.start() only initializes — it does NOT bind an HTTP listener.
+// We must run a Bun.serve() that delegates to app.fetch (Hono).
+Bun.serve({
+  port: env.PORT,
+  idleTimeout: 120, // keep SSE connections alive
+  fetch: (req) => app.fetch(req),
+});
+
 console.log(`[ShipMemory] Mentra client listening on port ${env.PORT}`);

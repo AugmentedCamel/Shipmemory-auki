@@ -1,11 +1,11 @@
-import type { AppSession } from '@mentra/sdk';
+import type { AppSession, AudioOutputStream } from '@mentra/sdk';
 import { AppState } from './state.js';
 import { buildSystemPrompt } from './promptTemplate.js';
 import { GeminiLiveClient, type GeminiFunctionCall } from '../gemini/liveClient.js';
 import { WeriftWhepClient } from '../bridge/whepClient.js';
 import { FrameRelay, jpegToFrame } from '../bridge/frameConverter.js';
 import { subscribeMic } from '../mentra/mic.js';
-import { speak, showText } from '../mentra/display.js';
+import { showText } from '../mentra/display.js';
 import { startLivestream, stopLivestream, type StreamStatusEvent } from '../mentra/camera.js';
 import { ShipMemoryService } from '../shipmemory/service.js';
 import { MockShipMemoryService, HardcodedUrlProvider } from '../shipmemory/mock.js';
@@ -29,9 +29,13 @@ export class SessionOrchestrator {
   private card: ContextCard | null = null;
   private frameRelay: FrameRelay | null = null;
 
-  // Buffer to accumulate transcription text before speaking
-  private pendingTranscription = '';
-  private transcriptionFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  // Audio output: Gemini Live PCM16 → Mentra AudioOutputStream → glasses speaker.
+  // Lazily created on first audio chunk; null between turns.
+  private audioOutPromise: Promise<AudioOutputStream> | null = null;
+  // Monotonic per-turn id. Late audio chunks tagged with a stale id are dropped
+  // (mirrors stepper-ai's cancelledResponseIds set; Gemini Live has no per-
+  // response_id, so we use turn boundaries instead).
+  private currentTurnId = 0;
 
   constructor(
     private session: AppSession,
@@ -39,16 +43,14 @@ export class SessionOrchestrator {
     private config: typeof Env,
   ) {
     this.gemini = new GeminiLiveClient(config.GEMINI_API_KEY, {
+      onAudioReceived: (b64) => this.handleAudioChunk(b64),
       onOutputTranscription: (text) => this.handleOutputTranscription(text),
       onInputTranscription: (text) => {
         console.log(`[User] ${text}`);
         transcriptEvents.emit('event', { type: 'user', text });
       },
-      onTurnComplete: () => {
-        this.flushTranscription();
-        transcriptEvents.emit('event', { type: 'turn_complete' });
-      },
-      onInterrupted: () => this.clearPendingTranscription(),
+      onTurnComplete: () => this.handleTurnComplete(),
+      onInterrupted: () => this.handleInterrupted(),
       onToolCall: (calls) => this.handleToolCalls(calls),
       onToolCallCancellation: (ids) => console.log(`[Gemini] Tool calls cancelled: ${ids.join(', ')}`),
       onDisconnected: (reason) => this.handleDisconnect(reason),
@@ -299,32 +301,58 @@ export class SessionOrchestrator {
   }
 
   private handleOutputTranscription(text: string): void {
-    this.pendingTranscription += text;
+    // Audio plays directly via Gemini → createOutputStream. Transcript is
+    // for the webview panel only; no TTS round-trip.
     transcriptEvents.emit('event', { type: 'ai', text });
-
-    // Debounce: flush after 300ms of no new text
-    if (this.transcriptionFlushTimer) clearTimeout(this.transcriptionFlushTimer);
-    this.transcriptionFlushTimer = setTimeout(() => this.flushTranscription(), 300);
   }
 
-  private flushTranscription(): void {
-    if (this.transcriptionFlushTimer) {
-      clearTimeout(this.transcriptionFlushTimer);
-      this.transcriptionFlushTimer = null;
+  private async handleAudioChunk(b64: string): Promise<void> {
+    const myTurn = this.currentTurnId;
+    if (!this.audioOutPromise) {
+      this.audioOutPromise = this.session.audio.createOutputStream({
+        format: 'pcm16',
+        sampleRate: 24000,
+        channels: 1,
+      });
     }
-    const text = this.pendingTranscription.trim();
-    if (!text) return;
-    this.pendingTranscription = '';
-
-    console.log(`[Gemini→TTS] ${text}`);
-    speak(this.session, text);
+    const promise = this.audioOutPromise;
+    let stream: AudioOutputStream;
+    try {
+      stream = await promise;
+    } catch (err) {
+      console.error('[Session:audio] createOutputStream failed:', err);
+      if (this.audioOutPromise === promise) this.audioOutPromise = null;
+      return;
+    }
+    // Drop chunks from a turn that was cancelled / completed while we awaited.
+    if (myTurn !== this.currentTurnId) return;
+    if (stream.state === 'streaming' || stream.state === 'created') {
+      stream.write(Buffer.from(b64, 'base64'));
+    }
   }
 
-  private clearPendingTranscription(): void {
-    this.pendingTranscription = '';
-    if (this.transcriptionFlushTimer) {
-      clearTimeout(this.transcriptionFlushTimer);
-      this.transcriptionFlushTimer = null;
+  private handleTurnComplete(): void {
+    transcriptEvents.emit('event', { type: 'turn_complete' });
+    this.currentTurnId++;
+    const promise = this.audioOutPromise;
+    this.audioOutPromise = null;
+    promise?.then((s) => s.end()).catch((err) => {
+      console.warn('[Session:audio] stream.end failed:', err instanceof Error ? err.message : err);
+    });
+  }
+
+  private handleInterrupted(): void {
+    console.log('[Session:audio] Interrupted — flushing audio output');
+    this.currentTurnId++;
+    const promise = this.audioOutPromise;
+    this.audioOutPromise = null;
+    if (promise) {
+      promise.then((s) => s.flush()).catch((err) => {
+        console.warn('[Session:audio] stream.flush failed:', err instanceof Error ? err.message : err);
+      });
+    } else {
+      // No active stream — safety net to cut any buffered playback on the phone.
+      try { this.session.audio.stopAudio(); } catch {}
     }
   }
 
@@ -410,7 +438,7 @@ export class SessionOrchestrator {
     safely('gemini.disconnect',   () => this.gemini.disconnect());
     safely('whep.stop',           () => this.whepClient.stop());
     safely('relay.stop',          () => this.frameRelay?.stop());
-    safely('clearTranscription',  () => this.clearPendingTranscription());
+    safely('audio.flush',         () => this.handleInterrupted());
     safely('unsubscribeStream',   () => this.unsubscribeStreamStatus?.());
     stopLivestream(this.session).catch((e) =>
       console.warn(`[Session] stopLivestream failed: ${e instanceof Error ? e.message : e}`),
