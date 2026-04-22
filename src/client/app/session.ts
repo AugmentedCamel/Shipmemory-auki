@@ -43,7 +43,7 @@ export class SessionOrchestrator {
     private config: typeof Env,
   ) {
     this.gemini = new GeminiLiveClient(config.GEMINI_API_KEY, {
-      onAudioReceived: (b64) => this.handleAudioChunk(b64),
+      onAudioReceived: (b64, arrivedAt) => this.handleAudioChunk(b64, arrivedAt),
       onOutputTranscription: (text) => this.handleOutputTranscription(text),
       onInputTranscription: (text) => {
         console.log(`[User] ${text}`);
@@ -51,6 +51,10 @@ export class SessionOrchestrator {
       },
       onTurnComplete: () => this.handleTurnComplete(),
       onInterrupted: () => this.handleInterrupted(),
+      onSpeechEnd: (speechEndAt, activityEndAt) => {
+        this.turnSpeechEndAt = speechEndAt;
+        this.turnActivityEndAt = activityEndAt;
+      },
       onToolCall: (calls) => this.handleToolCalls(calls),
       onToolCallCancellation: (ids) => console.log(`[Gemini] Tool calls cancelled: ${ids.join(', ')}`),
       onDisconnected: (reason) => this.handleDisconnect(reason),
@@ -417,6 +421,29 @@ export class SessionOrchestrator {
     }
   }
 
+  /**
+   * One-shot per-turn latency breakdown so we can see where wall-clock
+   * time is going between the user finishing their question and the
+   * first real audio byte shipping out to the cloud relay.
+   *
+   * Anything past the "ship to cloud" point (cloud → phone → ExoPlayer
+   * decode + playout) is invisible to us; if perceived latency is much
+   * larger than TOTAL here, the missing time is on the phone side.
+   */
+  private logLatencyBreakdown(shipAt: number): void {
+    const speechToActivity = this.turnActivityEndAt - this.turnSpeechEndAt;
+    const activityToGemini = this.turnFirstGeminiAt - this.turnActivityEndAt;
+    const geminiToShip = shipAt - this.turnFirstGeminiAt;
+    const total = shipAt - this.turnSpeechEndAt;
+    console.log(
+      `[Session:latency] turn ${this.currentTurnId}: ` +
+      `speech_end→activity_end=${speechToActivity}ms | ` +
+      `activity_end→gemini_first=${activityToGemini}ms | ` +
+      `gemini_first→ship=${geminiToShip}ms | ` +
+      `TOTAL=${total}ms (speech_end → first real byte shipped to cloud)`,
+    );
+  }
+
   // Throttled write-rate logger so we can see when audio is actively
   // flowing to the glasses and correlate with mic chunk gaps.
   private writeWindowStart = 0;
@@ -434,6 +461,14 @@ export class SessionOrchestrator {
   private turnDropsStale = 0;   // chunks dropped because turn changed mid-flight
   private turnFirstWriteAt = 0;
   private turnFirstMp3At = 0;
+
+  // Per-turn end-to-end latency markers. Each is a Date.now() captured at
+  // the named event; from these we derive the speech-end → first-byte-shipped
+  // breakdown that tells us where wall-clock time is going.
+  private turnSpeechEndAt = 0;       // last real mic chunk we received
+  private turnActivityEndAt = 0;     // we sent activityEnd to Gemini
+  private turnFirstGeminiAt = 0;     // first non-empty audio chunk arrived from Gemini
+  private turnLatencyLogged = false; // emit the breakdown line only once per turn
 
   /**
    * Wrap a freshly opened AudioOutputStream so we can see what actually
@@ -473,10 +508,22 @@ export class SessionOrchestrator {
     this.turnDropsStale = 0;
     this.turnFirstWriteAt = 0;
     this.turnFirstMp3At = 0;
+    this.turnSpeechEndAt = 0;
+    this.turnActivityEndAt = 0;
+    this.turnFirstGeminiAt = 0;
+    this.turnLatencyLogged = false;
   }
 
-  private async handleAudioChunk(b64: string): Promise<void> {
+  private async handleAudioChunk(b64: string, arrivedAt: number): Promise<void> {
     const myTurn = this.currentTurnId;
+    const bytes = Buffer.byteLength(b64, 'base64');
+    // Capture Gemini's first real-byte arrival the moment the WS callback
+    // fires — BEFORE we await the stream promise — so the latency reflects
+    // network + Gemini, not our own scheduling.
+    if (bytes > 0 && this.turnFirstGeminiAt === 0) {
+      this.turnFirstGeminiAt = arrivedAt;
+    }
+
     // Defensive: if the stream got nuked between turns, reopen lazily.
     if (!this.audioOutPromise) this.ensureAudioStream();
     const promise = this.audioOutPromise;
@@ -500,7 +547,6 @@ export class SessionOrchestrator {
     }
 
     if (stream.state === 'streaming' || stream.state === 'created') {
-      const bytes = Buffer.byteLength(b64, 'base64');
       this.turnPcmBytes += bytes;
       this.turnWrites++;
       if (this.turnFirstWriteAt === 0) this.turnFirstWriteAt = Date.now();
@@ -508,6 +554,14 @@ export class SessionOrchestrator {
       // Push the keepalive out — we just delivered real audio, no need for
       // silence fill until the next gap.
       this.scheduleKeepAlive();
+      // Emit one latency-breakdown line per turn the moment real audio
+      // bytes are first shipped to the SDK. Only fires when we actually
+      // know when the user stopped speaking (i.e. an activityEnd was sent
+      // for this turn — barge-in turns don't have one).
+      if (bytes > 0 && !this.turnLatencyLogged && this.turnSpeechEndAt > 0) {
+        this.turnLatencyLogged = true;
+        this.logLatencyBreakdown(Date.now());
+      }
 
       // Throttled write-rate log (once per ~1s of active writing).
       const now = Date.now();

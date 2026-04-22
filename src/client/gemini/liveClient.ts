@@ -16,7 +16,7 @@ export interface GeminiFunctionCall {
 
 export interface GeminiLiveCallbacks {
   onSetupComplete?: () => void;
-  onAudioReceived?: (pcmBase64: string) => void;
+  onAudioReceived?: (pcmBase64: string, arrivedAt: number) => void;
   onOutputTranscription?: (text: string) => void;
   onInputTranscription?: (text: string) => void;
   onTurnComplete?: () => void;
@@ -25,6 +25,10 @@ export interface GeminiLiveCallbacks {
   onToolCallCancellation?: (ids: string[]) => void;
   onDisconnected?: (reason?: string) => void;
   onError?: (err: Error) => void;
+  /** Fired when our 500ms silence-detect timer commits the user's turn.
+   *  speechEndAt = wall-clock of the last mic chunk we received from Mentra.
+   *  activityEndAt = wall-clock at which we sent activityEnd to Gemini. */
+  onSpeechEnd?: (speechEndAt: number, activityEndAt: number) => void;
 }
 
 /**
@@ -143,8 +147,9 @@ export class GeminiLiveClient {
       if (modelTurn?.parts) {
         for (const part of modelTurn.parts) {
           if (part.inlineData?.data) {
+            const arrivedAt = Date.now();
             console.log(`[Gemini:recv] Audio chunk received (${(part.inlineData.data.length * 0.75 / 1024).toFixed(1)}KB)`);
-            this.callbacks.onAudioReceived?.(part.inlineData.data);
+            this.callbacks.onAudioReceived?.(part.inlineData.data, arrivedAt);
           }
         }
       }
@@ -233,6 +238,7 @@ export class GeminiLiveClient {
   private sendAudioStreamEnd(): void {
     if (!this.ready || !this.ws || !this.audioStreamActive) return;
     this.audioStreamActive = false;
+    const speechEndAt = this.lastAudioSendTime;
 
     // Send the latest frame right before audioStreamEnd so Gemini
     // includes it in the current turn's processing.
@@ -245,9 +251,11 @@ export class GeminiLiveClient {
 
     // Manual VAD: end the user's activity explicitly so Gemini commits the
     // turn. audioStreamEnd flushes any buffered audio on the server.
-    console.log('[Gemini:audio] Sending activityEnd + audioStreamEnd (silence detected)');
+    const activityEndAt = Date.now();
+    console.log(`[Gemini:audio] Sending activityEnd + audioStreamEnd (silence detected, ${activityEndAt - speechEndAt}ms since last mic chunk)`);
     this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
     this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    this.callbacks.onSpeechEnd?.(speechEndAt, activityEndAt);
   }
 
   private videoFramesSent = 0;
