@@ -332,6 +332,13 @@ export class SessionOrchestrator {
       });
   }
 
+  // Throttled write-rate logger so we can see when audio is actively
+  // flowing to the glasses and correlate with mic chunk gaps.
+  private writeWindowStart = 0;
+  private writeWindowBytes = 0;
+  private writeWindowCount = 0;
+  private lastStreamState: string | null = null;
+
   private async handleAudioChunk(b64: string): Promise<void> {
     const myTurn = this.currentTurnId;
     // Defensive: if the stream got nuked between turns, reopen lazily.
@@ -346,8 +353,30 @@ export class SessionOrchestrator {
     }
     // Drop chunks from a turn cancelled while we were awaiting open().
     if (myTurn !== this.currentTurnId) return;
+
+    // Log every state transition on the output stream.
+    if (stream.state !== this.lastStreamState) {
+      console.log(`[Session:audio] stream state: ${this.lastStreamState ?? '(init)'} → ${stream.state}`);
+      this.lastStreamState = stream.state;
+    }
+
     if (stream.state === 'streaming' || stream.state === 'created') {
+      const bytes = Buffer.byteLength(b64, 'base64');
       stream.write(Buffer.from(b64, 'base64'));
+
+      // Throttled write-rate log (once per ~1s of active writing).
+      const now = Date.now();
+      if (!this.writeWindowStart) this.writeWindowStart = now;
+      this.writeWindowBytes += bytes;
+      this.writeWindowCount++;
+      if (now - this.writeWindowStart >= 1000) {
+        console.log(
+          `[Session:audio] writing — ${this.writeWindowCount} chunks, ${(this.writeWindowBytes / 1024).toFixed(1)}KB in ${now - this.writeWindowStart}ms (stream=${stream.state})`,
+        );
+        this.writeWindowStart = now;
+        this.writeWindowBytes = 0;
+        this.writeWindowCount = 0;
+      }
     }
   }
 
