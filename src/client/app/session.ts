@@ -236,6 +236,10 @@ export class SessionOrchestrator {
     showText(this.session, 'Ready — speak to begin');
     console.log('[Session] Gemini Live session active');
 
+    // Pre-warm the audio output stream so the first reply doesn't lose its
+    // opening words to ExoPlayer warmup.
+    this.ensureAudioStream();
+
     // Wire mic audio → Gemini
     subscribeMic(this.session, (pcm) => {
       this.gemini.sendAudio(pcm);
@@ -306,54 +310,84 @@ export class SessionOrchestrator {
     transcriptEvents.emit('event', { type: 'ai', text });
   }
 
+  /**
+   * Idempotently opens the audio output stream so the phone's ExoPlayer
+   * has the relay URL and is connected before the first chunk arrives.
+   * Without this, every turn pays a ~1s warmup penalty (bytes written
+   * before ExoPlayer subscribes are dropped by the relay).
+   */
+  private ensureAudioStream(): void {
+    if (this.audioOutPromise) return;
+    const promise = this.session.audio.createOutputStream({
+      format: 'pcm16',
+      sampleRate: 24000,
+      channels: 1,
+    });
+    this.audioOutPromise = promise;
+    promise
+      .then((s) => console.log(`[Session:audio] Output stream open (${s.streamId.slice(0, 8)})`))
+      .catch((err) => {
+        console.error('[Session:audio] createOutputStream failed:', err);
+        if (this.audioOutPromise === promise) this.audioOutPromise = null;
+      });
+  }
+
   private async handleAudioChunk(b64: string): Promise<void> {
     const myTurn = this.currentTurnId;
-    if (!this.audioOutPromise) {
-      this.audioOutPromise = this.session.audio.createOutputStream({
-        format: 'pcm16',
-        sampleRate: 24000,
-        channels: 1,
-      });
-    }
+    // Defensive: if the stream got nuked between turns, reopen lazily.
+    if (!this.audioOutPromise) this.ensureAudioStream();
     const promise = this.audioOutPromise;
+    if (!promise) return;
     let stream: AudioOutputStream;
     try {
       stream = await promise;
-    } catch (err) {
-      console.error('[Session:audio] createOutputStream failed:', err);
-      if (this.audioOutPromise === promise) this.audioOutPromise = null;
-      return;
+    } catch {
+      return; // already logged in ensureAudioStream
     }
-    // Drop chunks from a turn that was cancelled / completed while we awaited.
+    // Drop chunks from a turn cancelled while we were awaiting open().
     if (myTurn !== this.currentTurnId) return;
     if (stream.state === 'streaming' || stream.state === 'created') {
       stream.write(Buffer.from(b64, 'base64'));
     }
   }
 
+  /**
+   * Turn ended cleanly. Keep the audio stream OPEN across turns — closing
+   * and reopening per turn loses the first ~1s of the next reply to phone-
+   * side ExoPlayer warmup, and after enough cycles wedges the phone's audio
+   * pipeline. lamejs buffers at most ~48ms internally; the next turn's
+   * first write pushes it through.
+   */
   private handleTurnComplete(): void {
     transcriptEvents.emit('event', { type: 'turn_complete' });
     this.currentTurnId++;
-    const promise = this.audioOutPromise;
-    this.audioOutPromise = null;
-    promise?.then((s) => s.end()).catch((err) => {
-      console.warn('[Session:audio] stream.end failed:', err instanceof Error ? err.message : err);
-    });
   }
 
+  /**
+   * User barged in. flush() discards buffered audio on the phone and
+   * terminates the stream — we have to open a new one. Re-warm immediately
+   * so the user's next reply doesn't pay the open() penalty.
+   */
   private handleInterrupted(): void {
     console.log('[Session:audio] Interrupted — flushing audio output');
     this.currentTurnId++;
-    const promise = this.audioOutPromise;
+    const oldPromise = this.audioOutPromise;
     this.audioOutPromise = null;
-    if (promise) {
-      promise.then((s) => s.flush()).catch((err) => {
+    if (oldPromise) {
+      oldPromise.then((s) => s.flush()).catch((err) => {
         console.warn('[Session:audio] stream.flush failed:', err instanceof Error ? err.message : err);
       });
     } else {
-      // No active stream — safety net to cut any buffered playback on the phone.
       try { this.session.audio.stopAudio(); } catch {}
     }
+    this.ensureAudioStream();
+  }
+
+  /** Final cleanup at session end — flush without re-warming. */
+  private closeAudioStream(): void {
+    const promise = this.audioOutPromise;
+    this.audioOutPromise = null;
+    promise?.then((s) => s.flush()).catch(() => {});
   }
 
   private async handleToolCalls(calls: GeminiFunctionCall[]): Promise<void> {
@@ -438,7 +472,7 @@ export class SessionOrchestrator {
     safely('gemini.disconnect',   () => this.gemini.disconnect());
     safely('whep.stop',           () => this.whepClient.stop());
     safely('relay.stop',          () => this.frameRelay?.stop());
-    safely('audio.flush',         () => this.handleInterrupted());
+    safely('audio.close',         () => this.closeAudioStream());
     safely('unsubscribeStream',   () => this.unsubscribeStreamStatus?.());
     stopLivestream(this.session).catch((e) =>
       console.warn(`[Session] stopLivestream failed: ${e instanceof Error ? e.message : e}`),
