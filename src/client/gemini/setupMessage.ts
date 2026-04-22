@@ -17,13 +17,13 @@ export function buildSetupMessage(systemPrompt: string, card: ContextCard) {
       parts: [{ text: systemPrompt }],
     },
     realtimeInputConfig: {
-      automaticActivityDetection: {
-        disabled: false,
-        startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
-        endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-        silenceDurationMs: 500,
-        prefixPaddingMs: 40,
-      },
+      // Manual VAD. Mentra glasses deliver mic chunks only while the user is
+      // speaking (device firmware VAD), so Gemini's server VAD has no silence
+      // to detect — it would keep the turn open indefinitely and concatenate
+      // multiple utterances. Instead we send explicit activityStart /
+      // activityEnd + audioStreamEnd from the client based on the 500ms gap
+      // in chunk arrival.
+      automaticActivityDetection: { disabled: true },
       activityHandling: 'START_OF_ACTIVITY_INTERRUPTS',
       turnCoverage: 'TURN_INCLUDES_ALL_INPUT',
     },

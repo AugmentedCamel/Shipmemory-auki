@@ -196,16 +196,18 @@ export class GeminiLiveClient {
       this.lastAudioLogTime = now;
     }
 
-    // Mark audio stream as active — send a fresh frame at speech start
+    // Mark audio stream as active — send activityStart + a fresh frame.
     if (!this.audioStreamActive) {
       this.audioStreamActive = true;
+      // Manual VAD mode requires explicit activityStart before audio chunks.
+      this.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
       const latest = this.latestFrameProvider?.();
       if (latest?.jpeg) {
         const ageMs = Date.now() - latest.capturedAt;
-        console.log(`[Gemini:audio] Speech start — sending frame #${latest.frameNum} (age: ${ageMs}ms, ${(latest.jpeg.length / 1024).toFixed(1)}KB)`);
+        console.log(`[Gemini:audio] Speech start — sending activityStart + frame #${latest.frameNum} (age: ${ageMs}ms, ${(latest.jpeg.length / 1024).toFixed(1)}KB)`);
         this.sendVideoFrame(latest.jpeg, latest.frameNum);
       } else {
-        console.log('[Gemini:audio] Speech start — no frame available');
+        console.log('[Gemini:audio] Speech start — sending activityStart (no frame available)');
       }
     }
     this.lastAudioSendTime = now;
@@ -241,12 +243,11 @@ export class GeminiLiveClient {
       this.sendVideoFrame(latest.jpeg, latest.frameNum);
     }
 
-    console.log('[Gemini:audio] Sending audioStreamEnd (silence detected)');
-    this.ws.send(JSON.stringify({
-      realtimeInput: {
-        audioStreamEnd: true,
-      },
-    }));
+    // Manual VAD: end the user's activity explicitly so Gemini commits the
+    // turn. audioStreamEnd flushes any buffered audio on the server.
+    console.log('[Gemini:audio] Sending activityEnd + audioStreamEnd (silence detected)');
+    this.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+    this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
   }
 
   private videoFramesSent = 0;
