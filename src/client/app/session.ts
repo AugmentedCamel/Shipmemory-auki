@@ -233,12 +233,14 @@ export class SessionOrchestrator {
     const systemPrompt = buildSystemPrompt(card);
     await this.gemini.connect(systemPrompt, card);
 
-    showText(this.session, 'Ready — speak to begin');
     console.log('[Session] Gemini Live session active');
 
-    // Pre-warm the audio output stream so the first reply doesn't lose its
-    // opening words to ExoPlayer warmup.
-    this.ensureAudioStream();
+    // Pre-warm the audio output stream BEFORE the user can talk so
+    // ExoPlayer is fully buffered and ready to play the first reply
+    // without a "missing opening words" gap. Awaited deliberately.
+    await this.ensureAudioStream();
+
+    showText(this.session, 'Ready — speak to begin');
 
     // Wire mic audio → Gemini
     subscribeMic(this.session, (pcm) => {
@@ -316,8 +318,11 @@ export class SessionOrchestrator {
    * Without this, every turn pays a ~1s warmup penalty (bytes written
    * before ExoPlayer subscribes are dropped by the relay).
    */
-  private ensureAudioStream(): void {
-    if (this.audioOutPromise) return;
+  private async ensureAudioStream(): Promise<void> {
+    if (this.audioOutPromise) {
+      try { await this.audioOutPromise; } catch {}
+      return;
+    }
     const t0 = Date.now();
     const promise = this.session.audio
       .createOutputStream({
@@ -327,16 +332,33 @@ export class SessionOrchestrator {
       })
       .then((s) => this.instrumentStream(s));
     this.audioOutPromise = promise;
-    promise
-      .then((s) =>
-        console.log(
-          `[Session:audio] stream ${s.streamId.slice(0, 8)} ready in ${Date.now() - t0}ms (state=${s.state})`,
-        ),
-      )
-      .catch((err) => {
-        console.error('[Session:audio] createOutputStream failed:', err);
-        if (this.audioOutPromise === promise) this.audioOutPromise = null;
-      });
+    try {
+      const s = await promise;
+      console.log(
+        `[Session:audio] stream ${s.streamId.slice(0, 8)} ready in ${Date.now() - t0}ms (state=${s.state})`,
+      );
+      this.primeExoPlayerBuffer(s);
+    } catch (err) {
+      console.error('[Session:audio] createOutputStream failed:', err);
+      if (this.audioOutPromise === promise) this.audioOutPromise = null;
+    }
+  }
+
+  /**
+   * Push ~250ms of silence into the freshly-opened stream so ExoPlayer's
+   * MP3 decoder is warmed and its prebuffer is filled. Without this, the
+   * first real audio chunk has to wait for ExoPlayer to fill its initial
+   * buffer (~500ms over HTTP-chunked) before pressing play, which is what
+   * "missing the first second" actually was. 250ms silence at 24kHz mono
+   * int16 = 6000 samples = 12000 zero bytes. Lamejs encodes those into a
+   * couple of valid MP3 frames so the decoder sees real data, not EOF.
+   */
+  private primeExoPlayerBuffer(s: AudioOutputStream): void {
+    const SILENCE_MS = 250;
+    const bytes = (24000 * 2 * SILENCE_MS) / 1000; // sampleRate * 2B per sample
+    const silence = Buffer.alloc(bytes);
+    s.write(silence);
+    console.log(`[Session:audio] stream ${s.streamId.slice(0, 8)} primed with ${SILENCE_MS}ms silence (${bytes}B PCM)`);
   }
 
   // Throttled write-rate logger so we can see when audio is actively
@@ -484,52 +506,26 @@ export class SessionOrchestrator {
    * the new stream once it's open. Stale chunks (myTurn !== currentTurnId)
    * still get dropped before the write.
    */
+  /**
+   * Gemini sent an interrupt. Previously we flushed + re-opened the audio
+   * stream, but that triggered an SDK race ("audio play response for
+   * unknown request ID") that wedged ExoPlayer after a few cycles.
+   *
+   * Now we keep the stream open for the entire session. The currentTurnId
+   * bump still causes any in-flight Gemini chunks tagged with the old turn
+   * to be dropped in handleAudioChunk before they reach the encoder. The
+   * trade-off: whatever's already buffered on the phone-side ExoPlayer
+   * plays out to completion — we cannot stop it mid-buffer without
+   * tearing down the stream. That's acceptable; SDK stability wins.
+   */
   private handleInterrupted(): void {
-    const interruptStart = Date.now();
-    const turnAtInterrupt = this.currentTurnId;
     console.log(
-      `[Session:audio] interrupt — turn=${turnAtInterrupt} ` +
+      `[Session:audio] interrupt — turn=${this.currentTurnId} ` +
       `pcm_in=${(this.turnPcmBytes / 1024).toFixed(1)}KB mp3_out=${(this.turnMp3Bytes / 1024).toFixed(1)}KB ` +
-      `writes=${this.turnWrites} drops=${this.turnDropsState + this.turnDropsStale}`,
+      `writes=${this.turnWrites} drops=${this.turnDropsState + this.turnDropsStale} (stream stays open)`,
     );
     this.currentTurnId++;
     this.resetTurnMetrics();
-    const oldPromise = this.audioOutPromise;
-    let oldId = 'none';
-    let oldState = 'n/a';
-
-    const next = (async () => {
-      if (oldPromise) {
-        try {
-          const s = await oldPromise;
-          oldId = s.streamId.slice(0, 8);
-          oldState = s.state;
-          await s.flush();
-        } catch (err) {
-          console.warn('[Session:audio] flush failed:', err instanceof Error ? err.message : err);
-        }
-      } else {
-        try { this.session.audio.stopAudio(); } catch {}
-      }
-      const reopenStart = Date.now();
-      const s = await this.session.audio.createOutputStream({
-        format: 'pcm16',
-        sampleRate: 24000,
-        channels: 1,
-      });
-      const now = Date.now();
-      console.log(
-        `[Session:audio] re-opened: old=${oldId}(state=${oldState}) → new=${s.streamId.slice(0, 8)} ` +
-        `flush+reopen=${now - interruptStart}ms (open=${now - reopenStart}ms)`,
-      );
-      return this.instrumentStream(s);
-    })();
-
-    this.audioOutPromise = next;
-    next.catch((err) => {
-      console.error('[Session:audio] re-open after interrupt failed:', err);
-      if (this.audioOutPromise === next) this.audioOutPromise = null;
-    });
   }
 
   /** Final cleanup at session end — flush without re-warming. */
