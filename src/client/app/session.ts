@@ -359,6 +359,62 @@ export class SessionOrchestrator {
     const silence = Buffer.alloc(bytes);
     s.write(silence);
     console.log(`[Session:audio] stream ${s.streamId.slice(0, 8)} primed with ${SILENCE_MS}ms silence (${bytes}B PCM)`);
+    // Arm the keepalive so silence keeps flowing during pre-first-turn idle.
+    this.scheduleKeepAlive();
+  }
+
+  /**
+   * Silence keepalive. MP3-over-HTTP-chunked needs continuous byte flow or
+   * ExoPlayer underruns/idles its decoder; once that happens, subsequent
+   * writes on the same stream are silently ignored on the phone side.
+   *
+   * Between Gemini turns there's a 4-8s gap where no real audio flows. We
+   * fill it with short silence bursts (~100ms every 500ms) so the decoder
+   * stays warm and the next real reply plays cleanly. This mirrors the
+   * always-on AudioRecord pattern in the Android reference client and what
+   * stepper-ai relies on.
+   *
+   * Re-armed after every real audio write — when Gemini is actively
+   * streaming, the timer never fires.
+   */
+  private readonly KEEPALIVE_IDLE_MS = 500;
+  private readonly KEEPALIVE_SILENCE_MS = 100;
+  private silenceKeepAliveTimer: ReturnType<typeof setTimeout> | null = null;
+  private keepAliveWrites = 0;
+  private keepAliveLastLogged = 0;
+
+  private scheduleKeepAlive(): void {
+    if (this.silenceKeepAliveTimer) clearTimeout(this.silenceKeepAliveTimer);
+    this.silenceKeepAliveTimer = setTimeout(() => {
+      this.silenceKeepAliveTimer = null;
+      void this.writeKeepAliveSilence();
+    }, this.KEEPALIVE_IDLE_MS);
+  }
+
+  private async writeKeepAliveSilence(): Promise<void> {
+    if (!this.audioOutPromise) return;
+    let stream: AudioOutputStream;
+    try { stream = await this.audioOutPromise; } catch { return; }
+    if (stream.state !== 'streaming') return;
+    const bytes = (24000 * 2 * this.KEEPALIVE_SILENCE_MS) / 1000;
+    stream.write(Buffer.alloc(bytes));
+    this.keepAliveWrites++;
+    const now = Date.now();
+    if (now - this.keepAliveLastLogged >= 2000) {
+      console.log(
+        `[Session:audio] keepalive silence x${this.keepAliveWrites} ` +
+        `(${this.KEEPALIVE_SILENCE_MS}ms bursts every ${this.KEEPALIVE_IDLE_MS}ms during gaps)`,
+      );
+      this.keepAliveLastLogged = now;
+    }
+    this.scheduleKeepAlive();
+  }
+
+  private cancelKeepAlive(): void {
+    if (this.silenceKeepAliveTimer) {
+      clearTimeout(this.silenceKeepAliveTimer);
+      this.silenceKeepAliveTimer = null;
+    }
   }
 
   // Throttled write-rate logger so we can see when audio is actively
@@ -449,6 +505,9 @@ export class SessionOrchestrator {
       this.turnWrites++;
       if (this.turnFirstWriteAt === 0) this.turnFirstWriteAt = Date.now();
       stream.write(Buffer.from(b64, 'base64'));
+      // Push the keepalive out — we just delivered real audio, no need for
+      // silence fill until the next gap.
+      this.scheduleKeepAlive();
 
       // Throttled write-rate log (once per ~1s of active writing).
       const now = Date.now();
@@ -530,6 +589,7 @@ export class SessionOrchestrator {
 
   /** Final cleanup at session end — flush without re-warming. */
   private closeAudioStream(): void {
+    this.cancelKeepAlive();
     const promise = this.audioOutPromise;
     this.audioOutPromise = null;
     promise?.then((s) => s.flush()).catch(() => {});
