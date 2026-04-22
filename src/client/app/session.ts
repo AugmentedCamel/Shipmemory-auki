@@ -318,14 +318,21 @@ export class SessionOrchestrator {
    */
   private ensureAudioStream(): void {
     if (this.audioOutPromise) return;
-    const promise = this.session.audio.createOutputStream({
-      format: 'pcm16',
-      sampleRate: 24000,
-      channels: 1,
-    });
+    const t0 = Date.now();
+    const promise = this.session.audio
+      .createOutputStream({
+        format: 'pcm16',
+        sampleRate: 24000,
+        channels: 1,
+      })
+      .then((s) => this.instrumentStream(s));
     this.audioOutPromise = promise;
     promise
-      .then((s) => console.log(`[Session:audio] Output stream open (${s.streamId.slice(0, 8)})`))
+      .then((s) =>
+        console.log(
+          `[Session:audio] stream ${s.streamId.slice(0, 8)} ready in ${Date.now() - t0}ms (state=${s.state})`,
+        ),
+      )
       .catch((err) => {
         console.error('[Session:audio] createOutputStream failed:', err);
         if (this.audioOutPromise === promise) this.audioOutPromise = null;
@@ -338,6 +345,57 @@ export class SessionOrchestrator {
   private writeWindowBytes = 0;
   private writeWindowCount = 0;
   private lastStreamState: string | null = null;
+
+  // Per-turn audio metrics. Reset on each turn boundary (turnComplete /
+  // interrupted) so we can correlate "missed first second" / "stopped after
+  // a while" with what the SDK actually saw and emitted.
+  private turnPcmBytes = 0;
+  private turnMp3Bytes = 0;
+  private turnWrites = 0;
+  private turnDropsState = 0;   // chunks dropped because stream wasn't 'streaming'
+  private turnDropsStale = 0;   // chunks dropped because turn changed mid-flight
+  private turnFirstWriteAt = 0;
+  private turnFirstMp3At = 0;
+
+  /**
+   * Wrap a freshly opened AudioOutputStream so we can see what actually
+   * leaves the SDK after lamejs encoding (the bytes ExoPlayer will see),
+   * and so we get notified if the SDK closes/errors the stream behind our
+   * back. Both `close` and `error` are already emitted by the SDK — we just
+   * never subscribed.
+   */
+  private instrumentStream(s: AudioOutputStream): AudioOutputStream {
+    const id = s.streamId.slice(0, 8);
+    // sendBinaryFrame is the function the SDK calls with the post-lamejs
+    // MP3 bytes. Wrapping it lets us count the real bytes-on-the-wire to
+    // the cloud relay (and ExoPlayer). Lamejs returns 0 bytes during warm
+    // up, so this is the only way to see whether the first write actually
+    // produced an MP3 frame yet.
+    const sAny = s as unknown as { sendBinaryFrame: (b: Uint8Array) => void };
+    const original = sAny.sendBinaryFrame.bind(s);
+    sAny.sendBinaryFrame = (audioData: Uint8Array) => {
+      if (audioData.length > 0 && this.turnFirstMp3At === 0) {
+        this.turnFirstMp3At = Date.now();
+        const lag = this.turnFirstWriteAt ? this.turnFirstMp3At - this.turnFirstWriteAt : 0;
+        console.log(`[Session:audio] stream ${id} first MP3 frame: ${audioData.length}B (warmup: ${lag}ms after first PCM write)`);
+      }
+      this.turnMp3Bytes += audioData.length;
+      return original(audioData);
+    };
+    s.on('close', () => console.log(`[Session:audio] stream ${id} closed (state=${s.state})`));
+    s.on('error', (err) => console.error(`[Session:audio] stream ${id} error:`, err));
+    return s;
+  }
+
+  private resetTurnMetrics(): void {
+    this.turnPcmBytes = 0;
+    this.turnMp3Bytes = 0;
+    this.turnWrites = 0;
+    this.turnDropsState = 0;
+    this.turnDropsStale = 0;
+    this.turnFirstWriteAt = 0;
+    this.turnFirstMp3At = 0;
+  }
 
   private async handleAudioChunk(b64: string): Promise<void> {
     const myTurn = this.currentTurnId;
@@ -352,7 +410,10 @@ export class SessionOrchestrator {
       return; // already logged in ensureAudioStream
     }
     // Drop chunks from a turn cancelled while we were awaiting open().
-    if (myTurn !== this.currentTurnId) return;
+    if (myTurn !== this.currentTurnId) {
+      this.turnDropsStale++;
+      return;
+    }
 
     // Log every state transition on the output stream.
     if (stream.state !== this.lastStreamState) {
@@ -362,6 +423,9 @@ export class SessionOrchestrator {
 
     if (stream.state === 'streaming' || stream.state === 'created') {
       const bytes = Buffer.byteLength(b64, 'base64');
+      this.turnPcmBytes += bytes;
+      this.turnWrites++;
+      if (this.turnFirstWriteAt === 0) this.turnFirstWriteAt = Date.now();
       stream.write(Buffer.from(b64, 'base64'));
 
       // Throttled write-rate log (once per ~1s of active writing).
@@ -377,6 +441,8 @@ export class SessionOrchestrator {
         this.writeWindowBytes = 0;
         this.writeWindowCount = 0;
       }
+    } else {
+      this.turnDropsState++;
     }
   }
 
@@ -388,6 +454,20 @@ export class SessionOrchestrator {
    * first write pushes it through.
    */
   private handleTurnComplete(): void {
+    if (this.turnWrites > 0) {
+      const dur = this.turnFirstWriteAt ? Date.now() - this.turnFirstWriteAt : 0;
+      console.log(
+        `[Session:audio] turn ${this.currentTurnId} done — pcm_in=${(this.turnPcmBytes / 1024).toFixed(1)}KB ` +
+        `mp3_out=${(this.turnMp3Bytes / 1024).toFixed(1)}KB writes=${this.turnWrites} ` +
+        `drops(state/stale)=${this.turnDropsState}/${this.turnDropsStale} dur=${dur}ms`,
+      );
+    } else if (this.turnDropsState + this.turnDropsStale > 0) {
+      console.warn(
+        `[Session:audio] turn ${this.currentTurnId} done — ALL chunks dropped ` +
+        `(state=${this.turnDropsState} stale=${this.turnDropsStale})`,
+      );
+    }
+    this.resetTurnMetrics();
     transcriptEvents.emit('event', { type: 'turn_complete' });
     this.currentTurnId++;
   }
@@ -405,14 +485,25 @@ export class SessionOrchestrator {
    * still get dropped before the write.
    */
   private handleInterrupted(): void {
-    console.log('[Session:audio] Interrupted — flushing audio output');
+    const interruptStart = Date.now();
+    const turnAtInterrupt = this.currentTurnId;
+    console.log(
+      `[Session:audio] interrupt — turn=${turnAtInterrupt} ` +
+      `pcm_in=${(this.turnPcmBytes / 1024).toFixed(1)}KB mp3_out=${(this.turnMp3Bytes / 1024).toFixed(1)}KB ` +
+      `writes=${this.turnWrites} drops=${this.turnDropsState + this.turnDropsStale}`,
+    );
     this.currentTurnId++;
+    this.resetTurnMetrics();
     const oldPromise = this.audioOutPromise;
+    let oldId = 'none';
+    let oldState = 'n/a';
 
     const next = (async () => {
       if (oldPromise) {
         try {
           const s = await oldPromise;
+          oldId = s.streamId.slice(0, 8);
+          oldState = s.state;
           await s.flush();
         } catch (err) {
           console.warn('[Session:audio] flush failed:', err instanceof Error ? err.message : err);
@@ -420,20 +511,25 @@ export class SessionOrchestrator {
       } else {
         try { this.session.audio.stopAudio(); } catch {}
       }
-      return this.session.audio.createOutputStream({
+      const reopenStart = Date.now();
+      const s = await this.session.audio.createOutputStream({
         format: 'pcm16',
         sampleRate: 24000,
         channels: 1,
       });
+      const now = Date.now();
+      console.log(
+        `[Session:audio] re-opened: old=${oldId}(state=${oldState}) → new=${s.streamId.slice(0, 8)} ` +
+        `flush+reopen=${now - interruptStart}ms (open=${now - reopenStart}ms)`,
+      );
+      return this.instrumentStream(s);
     })();
 
     this.audioOutPromise = next;
-    next
-      .then((s) => console.log(`[Session:audio] Output stream re-opened (${s.streamId.slice(0, 8)})`))
-      .catch((err) => {
-        console.error('[Session:audio] re-open after interrupt failed:', err);
-        if (this.audioOutPromise === next) this.audioOutPromise = null;
-      });
+    next.catch((err) => {
+      console.error('[Session:audio] re-open after interrupt failed:', err);
+      if (this.audioOutPromise === next) this.audioOutPromise = null;
+    });
   }
 
   /** Final cleanup at session end — flush without re-warming. */
