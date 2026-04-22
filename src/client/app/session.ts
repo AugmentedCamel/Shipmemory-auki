@@ -364,23 +364,47 @@ export class SessionOrchestrator {
   }
 
   /**
-   * User barged in. flush() discards buffered audio on the phone and
-   * terminates the stream — we have to open a new one. Re-warm immediately
-   * so the user's next reply doesn't pay the open() penalty.
+   * Interrupt fires on user barge-in AND when Gemini decides to call a tool
+   * (it clears its pending model audio so the post-tool reply can take over).
+   *
+   * flush() terminates the stream, so we have to open a new one. The flush
+   * and the create MUST be sequential — the SDK's activeOutputStream guard
+   * rejects createOutputStream with AUDIO_STREAM_ALREADY_ACTIVE while the
+   * old stream is still 'streaming'. We chain them in a single promise so
+   * concurrent handleAudioChunk callers await the same chain and write into
+   * the new stream once it's open. Stale chunks (myTurn !== currentTurnId)
+   * still get dropped before the write.
    */
   private handleInterrupted(): void {
     console.log('[Session:audio] Interrupted — flushing audio output');
     this.currentTurnId++;
     const oldPromise = this.audioOutPromise;
-    this.audioOutPromise = null;
-    if (oldPromise) {
-      oldPromise.then((s) => s.flush()).catch((err) => {
-        console.warn('[Session:audio] stream.flush failed:', err instanceof Error ? err.message : err);
+
+    const next = (async () => {
+      if (oldPromise) {
+        try {
+          const s = await oldPromise;
+          await s.flush();
+        } catch (err) {
+          console.warn('[Session:audio] flush failed:', err instanceof Error ? err.message : err);
+        }
+      } else {
+        try { this.session.audio.stopAudio(); } catch {}
+      }
+      return this.session.audio.createOutputStream({
+        format: 'pcm16',
+        sampleRate: 24000,
+        channels: 1,
       });
-    } else {
-      try { this.session.audio.stopAudio(); } catch {}
-    }
-    this.ensureAudioStream();
+    })();
+
+    this.audioOutPromise = next;
+    next
+      .then((s) => console.log(`[Session:audio] Output stream re-opened (${s.streamId.slice(0, 8)})`))
+      .catch((err) => {
+        console.error('[Session:audio] re-open after interrupt failed:', err);
+        if (this.audioOutPromise === next) this.audioOutPromise = null;
+      });
   }
 
   /** Final cleanup at session end — flush without re-warming. */
