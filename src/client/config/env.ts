@@ -18,4 +18,12 @@ export const env = {
   CONTEXT_CARD_URL: process.env.CONTEXT_CARD_URL ?? null,
   /** Comma-separated URL prefixes allowed for QR payload / card.execute_url / card.trace_url. Defaults to BRIDGE_BASE_URL. */
   ALLOWED_URL_PREFIXES: process.env.ALLOWED_URL_PREFIXES ?? null,
+  /**
+   * Oneshot-specific: redirect base for `oneshot.glass/c/{code}` short URLs.
+   * NOT part of the ShipMemory Protocol — this is a custom client-side shim
+   * that rewrites our browser-facing landing host to our JSON edge service.
+   * Other implementers of the protocol should NOT copy this; they'd point to
+   * their own edge host (or skip the rewrite entirely).
+   */
+  SHIP_EDGE_BASE_URL: process.env.SHIP_EDGE_BASE_URL ?? 'https://shipedge-production.up.railway.app',
 } as const;

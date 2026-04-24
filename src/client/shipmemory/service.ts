@@ -4,6 +4,7 @@ import { decodeQR } from './qrDecoder.js';
 import { decodeSM1 } from './sm1.js';
 import { fetchContextCard, parseContextCardJSON } from './urlFetch.js';
 import { isAllowed, allowedPrefixes } from './allowlist.js';
+import { env } from '../config/env.js';
 
 const CONSENSUS_REQUIRED = 1;
 
@@ -63,8 +64,12 @@ export class ShipMemoryService implements ContextProvider {
     const normalized = normalizeQRPayload(decoded);
 
     if (normalized.kind === 'url') {
-      console.log(`[QR] Fetching card from URL: ${normalized.url.slice(0, 120)}`);
-      const card = await fetchContextCard(normalized.url, this.apiKey);
+      const fetchUrl = rewriteOneshotShortUrl(normalized.url);
+      if (fetchUrl !== normalized.url) {
+        console.log(`[QR] Rewriting landing URL to edge: ${normalized.url} → ${fetchUrl}`);
+      }
+      console.log(`[QR] Fetching card from URL: ${fetchUrl.slice(0, 120)}`);
+      const card = await fetchContextCard(fetchUrl, this.apiKey);
       return sanitizeCardUrls(card);
     }
 
@@ -107,6 +112,24 @@ export function normalizeQRPayload(decoded: string): NormalizedPayload {
   }
   // Rule 5: inline (JSON or plain text)
   return { kind: 'inline', text: decoded };
+}
+
+/**
+ * ⚠️ CUSTOM CLIENT-SPECIFIC SHIM — NOT part of the ShipMemory Protocol.
+ *
+ * `https://oneshot.glass/c/{code}` is our public, browser-facing landing page
+ * (static HTML for phones that scan the QR without the glasses app). The
+ * ContextCard JSON lives on a separate edge service at $SHIP_EDGE_BASE_URL.
+ *
+ * This rewrite is the "client-side rewrite to edge" hinted at in protocol
+ * §3.2.1, but the specific hostnames and mapping are ours. Other clients
+ * implementing the ShipMemory Protocol should NOT copy this function — they
+ * should either point at their own edge host or omit the rewrite entirely.
+ */
+function rewriteOneshotShortUrl(url: string): string {
+  const match = url.match(/^https:\/\/oneshot\.glass(\/c\/.+)$/i);
+  if (!match) return url;
+  return `${env.SHIP_EDGE_BASE_URL.replace(/\/$/, '')}${match[1]}`;
 }
 
 /** Null out execute_url/trace_url that fail the allowlist — keep the rest of the card usable. */

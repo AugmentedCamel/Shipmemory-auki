@@ -3,7 +3,7 @@ import { env } from '../config/env.js';
 /**
  * Parse the configured allowlist once. Sources:
  *   - ALLOWED_URL_PREFIXES (comma-separated, preferred)
- *   - BRIDGE_BASE_URL (fallback — trust our own bridge by default)
+ *   - BRIDGE_BASE_URL + SHIP_EDGE_BASE_URL (fallback defaults for our stack)
  * Empty list means NOTHING is allowed.
  */
 function buildPrefixes(): string[] {
@@ -11,7 +11,10 @@ function buildPrefixes(): string[] {
   if (raw) {
     return raw.split(',').map((s) => s.trim()).filter(Boolean);
   }
-  return env.BRIDGE_BASE_URL ? [env.BRIDGE_BASE_URL] : [];
+  const defaults: string[] = [];
+  if (env.BRIDGE_BASE_URL) defaults.push(env.BRIDGE_BASE_URL);
+  if (env.SHIP_EDGE_BASE_URL) defaults.push(env.SHIP_EDGE_BASE_URL);
+  return defaults;
 }
 
 const PREFIXES = buildPrefixes();
