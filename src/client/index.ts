@@ -80,7 +80,7 @@ class ShipMemoryApp extends AppServer {
       const started = sessionId ? this.startedSessions.has(sessionId) : false;
       const canRescan = appState === 'SCANNING' && streamState.scanStatus === 'timeout';
       const canRestartStream = appState === 'SESSION';
-      const canStartOver = started && (!!streamState.sessionEndReason || appState !== 'IDLE');
+      const canStopSession = appState === 'SESSION';
       return c.json({
         sessionId,
         hasSession: !!sessionId,
@@ -92,7 +92,7 @@ class ShipMemoryApp extends AppServer {
         sessionEndReason: streamState.sessionEndReason,
         canRescan,
         canRestartStream,
-        canStartOver,
+        canStopSession,
       });
     });
 
@@ -155,22 +155,22 @@ class ShipMemoryApp extends AppServer {
       return c.json({ status: 'restarting', sessionId });
     });
 
-    // User-initiated stop: tears the orchestrator down and recreates a
-    // fresh one so the Start button reappears in the webview.
-    this.post('/api/stop', (c) => {
+    // User-initiated stop of the Gemini session. Ends Gemini, closes
+    // audio, and drops the orchestrator back into scan mode so the next
+    // QR starts a fresh session. Leaves the orchestrator + camera + WHEP
+    // loop alive.
+    this.post('/api/stop-session', (c) => {
       const sessionId = this.orchestrators.keys().next().value ?? null;
-      if (!sessionId) return c.json({ error: 'No active session' }, 404);
-      console.log(`[ShipMemory] User triggered stop for ${sessionId}`);
-      // Trigger the orchestrator's onEnded path so a fresh orchestrator is
-      // stood up automatically (same flow as Gemini disconnect).
-      const orchestrator = this.orchestrators.get(sessionId);
-      if (orchestrator?.onEnded) {
-        streamState.sessionEndReason = 'user_stop';
-        orchestrator.onEnded('user_stop');
-      } else {
-        this.cleanupSession(sessionId, 'user_stop');
+      const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
+      if (!orchestrator) return c.json({ error: 'No active session' }, 404);
+      if (orchestrator.getState() !== 'SESSION') {
+        return c.json({ error: `Cannot stop session in state=${orchestrator.getState()}` }, 409);
       }
-      return c.json({ status: 'stopped', sessionId });
+      console.log(`[ShipMemory] User stopped Gemini session for ${sessionId}`);
+      orchestrator.stopSession().catch((err) => {
+        console.error(`[ShipMemory] stopSession failed for ${sessionId}:`, err);
+      });
+      return c.json({ status: 'stopping', sessionId });
     });
 
     // SSE stream of Gemini transcription events (user speech + AI reply).
@@ -235,23 +235,11 @@ class ShipMemoryApp extends AppServer {
 
     session.layouts.showTextWall('Waiting for start — tap on phone');
 
-    // When Gemini disconnects the orchestrator flips itself to IDLE; we
-    // tear it down and stand up a fresh one so the webview's next poll
-    // sees started=false and can offer a new Start button without the
-    // user having to relaunch the app. Factory recreates itself after
-    // each end so repeated restart cycles all wire onEnded correctly.
-    const makeOrchestrator = (): SessionOrchestrator => {
-      const o = new SessionOrchestrator(session, sessionId, env);
-      o.onEnded = (reason) => {
-        if (this.orchestrators.get(sessionId) !== o) return;
-        console.log(`[ShipMemory] Session ${sessionId} ended (${reason}) — recreating orchestrator`);
-        this.cleanupSession(sessionId, `session_ended:${reason}`);
-        streamState.sessionEndReason = reason;
-        this.orchestrators.set(sessionId, makeOrchestrator());
-      };
-      return o;
-    };
-    const orchestrator = makeOrchestrator();
+    // Single orchestrator per Mentra session. When Gemini disconnects the
+    // orchestrator auto-returns to SCANNING and starts a fresh scan, so
+    // we never have to recreate it from here — only onStop / grace-expired
+    // tear it down.
+    const orchestrator = new SessionOrchestrator(session, sessionId, env);
     this.orchestrators.set(sessionId, orchestrator);
     this.startedSessions.delete(sessionId);
 
@@ -420,111 +408,395 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ShipMemory — Live View</title>
+  <title>ShipMemory</title>
   <style>
+    :root {
+      --bg: #0a0a0a;
+      --panel: #111827;
+      --panel-2: #0f172a;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --dim: #6b7280;
+      --accent: #10b981;
+      --accent-2: #34d399;
+      --amber: #f59e0b;
+      --amber-bg: #78350f;
+      --amber-fg: #fde68a;
+      --red: #ef4444;
+      --red-bg: #7f1d1d;
+      --red-fg: #fecaca;
+      --neutral-bg: #1f2937;
+      --neutral-fg: #9ca3af;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
     body {
-      background: #0a0a0a;
-      color: #fff;
+      background: var(--bg);
+      color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ---------------- Start screen ---------------- */
+    #start-screen {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      gap: 28px;
+    }
+    #start-screen .brand {
+      font-size: 1.7rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+    #start-screen .subtitle {
+      color: var(--muted);
+      font-size: 0.95rem;
+      text-align: center;
+      margin-top: -16px;
+    }
+    #start-screen ol {
+      list-style: none;
+      counter-reset: step;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      max-width: 320px;
+      width: 100%;
+    }
+    #start-screen ol li {
+      counter-increment: step;
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text);
+      font-size: 0.95rem;
+      line-height: 1.4;
+    }
+    #start-screen ol li::before {
+      content: counter(step);
+      flex: 0 0 24px;
+      height: 24px;
       display: flex;
       align-items: center;
       justify-content: center;
-      overflow: hidden;
+      background: var(--accent);
+      color: #042014;
+      font-weight: 700;
+      font-size: 0.8rem;
+      border-radius: 999px;
     }
-    #status {
+    #start-screen #start-status {
+      color: var(--muted);
+      font-size: 0.9rem;
+      min-height: 1.2em;
       text-align: center;
-      font-size: 1.4rem;
-      color: #888;
-      transition: opacity 0.4s;
     }
-    #status .dot {
-      display: inline-block;
-      animation: pulse 1.5s infinite;
+    #start-btn {
+      padding: 16px 56px;
+      font-size: 1.2rem;
+      font-weight: 700;
+      background: var(--accent);
+      color: #042014;
+      border: none;
+      border-radius: 14px;
+      cursor: pointer;
+      box-shadow: 0 6px 20px rgba(16, 185, 129, 0.25);
+      transition: transform 0.1s, opacity 0.2s;
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 0.3; }
-      50% { opacity: 1; }
+    #start-btn:hover { transform: translateY(-1px); }
+    #start-btn:active { transform: translateY(0); }
+    #start-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    /* ---------------- Main screen ---------------- */
+    #main-screen { flex: 1; display: none; flex-direction: column; min-height: 0; }
+
+    #toolbar {
+      flex: 0 0 auto;
+      padding: 14px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 14px;
     }
+    #status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+      background: var(--neutral-fg);
+      box-shadow: 0 0 0 0 currentColor;
+    }
+    #status-dot.pulsing {
+      animation: statusPulse 1.4s ease-in-out infinite;
+    }
+    @keyframes statusPulse {
+      0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 0.85; }
+      50% { box-shadow: 0 0 0 6px rgba(255, 255, 255, 0); opacity: 1; }
+    }
+    #status-text {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      flex: 1;
+    }
+    #status-label {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.2;
+    }
+    #status-detail {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 2px;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #status-chip {
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      background: var(--neutral-bg);
+      color: var(--neutral-fg);
+      flex: 0 0 auto;
+    }
+
+    #action-bar {
+      flex: 0 0 auto;
+      padding: 12px 16px;
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+      min-height: 60px;
+    }
+    #action-bar button {
+      padding: 10px 18px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      cursor: pointer;
+      background: var(--panel);
+      color: var(--text);
+      transition: background 0.15s, border-color 0.15s;
+    }
+    #action-bar button:hover { background: #1e293b; }
+    #action-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #action-bar button.primary {
+      background: var(--red-bg);
+      color: var(--red-fg);
+      border-color: #991b1b;
+    }
+    #action-bar button.primary:hover { background: #991b1b; }
+    #action-bar button.warn {
+      background: var(--amber-bg);
+      color: var(--amber-fg);
+      border-color: #92400e;
+    }
+    #action-bar button.warn:hover { background: #92400e; }
+    #action-bar .empty { color: var(--dim); font-size: 0.85rem; padding: 10px 0; }
+
+    #viewer {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      background: #000;
+      min-height: 0;
+    }
+    #iframe-player { width: 100%; height: 100%; display: none; }
+    #preview-iframe { width: 100%; height: 100%; border: none; }
+    #viewer-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--dim);
+      font-size: 0.95rem;
+      text-align: center;
+      padding: 20px;
+    }
+
+    #transcript {
+      flex: 0 0 auto;
+      max-height: 30vh;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.9);
+      color: var(--text);
+      font-size: 0.95rem;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+      line-height: 1.4;
+    }
+    #user-line { color: #93c5fd; margin-bottom: 4px; }
+    #ai-line { color: #6ee7b7; }
+    .role-tag { opacity: 0.55; margin-right: 4px; }
   </style>
 </head>
 <body>
-  <div id="mode-badge" style="position:fixed; top:12px; left:50%; transform:translateX(-50%); z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
-  <div id="reconnect-banner" style="display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); z-index:49; padding:8px 18px; border-radius:10px; font-size:0.85rem; font-weight:600; background:#7c2d12; color:#fed7aa; letter-spacing:0.02em; box-shadow:0 4px 12px rgba(0,0,0,0.3);">Reconnecting stream…</div>
-  <div id="ended-banner" style="display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); z-index:48; padding:8px 18px; border-radius:10px; font-size:0.85rem; font-weight:600; background:#1e3a8a; color:#dbeafe; letter-spacing:0.02em; box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
-
-  <div id="action-bar" style="display:none; position:fixed; top:96px; left:50%; transform:translateX(-50%); z-index:47; display:flex; gap:8px; flex-wrap:wrap; justify-content:center; max-width:90vw;">
-    <button id="rescan-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#d97706; color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Scan again</button>
-    <button id="restart-stream-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#7c2d12; color:#fed7aa; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Restart stream</button>
-    <button id="stop-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#374151; color:#e5e7eb; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Start new session</button>
+  <!-- ======== Start screen ======== -->
+  <div id="start-screen">
+    <svg width="128" height="128" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+      <rect x="8"  y="8"  width="28" height="28" rx="4" stroke="#10b981" stroke-width="3.5"/>
+      <rect x="16" y="16" width="12" height="12" fill="#10b981" rx="1.5"/>
+      <rect x="64" y="8"  width="28" height="28" rx="4" stroke="#10b981" stroke-width="3.5"/>
+      <rect x="72" y="16" width="12" height="12" fill="#10b981" rx="1.5"/>
+      <rect x="8"  y="64" width="28" height="28" rx="4" stroke="#10b981" stroke-width="3.5"/>
+      <rect x="16" y="72" width="12" height="12" fill="#10b981" rx="1.5"/>
+      <rect x="44" y="44" width="8" height="8" fill="#34d399" rx="1"/>
+      <rect x="56" y="56" width="8" height="8" fill="#34d399" rx="1"/>
+      <rect x="44" y="64" width="6" height="6" fill="#34d399" rx="1"/>
+      <rect x="64" y="44" width="6" height="6" fill="#34d399" rx="1"/>
+      <rect x="66" y="66" width="10" height="10" fill="#34d399" rx="1"/>
+    </svg>
+    <div class="brand">ShipMemory</div>
+    <ol>
+      <li>Press <strong>Start</strong> to begin the live stream from your glasses.</li>
+      <li>Scan a <strong>QR code</strong> to start the live agent session.</li>
+    </ol>
+    <button id="start-btn">Start</button>
+    <div id="start-status">Checking session…</div>
   </div>
 
-  <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:16px; max-width:420px; padding:0 20px;">
-    <div id="gate-header" style="display:none; font-size:1.4rem; color:#e5e7eb; text-align:center; font-weight:600;">ShipMemory</div>
-    <div id="gate-subheader" style="display:none; font-size:1rem; color:#9ca3af; text-align:center;">Scan a QR to start a voice session.</div>
-    <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
-    <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600; transition:opacity 0.2s;">Start</button>
-    <style>
-      #start-btn:disabled { opacity:0.4; cursor:not-allowed; }
-      #rescan-btn:disabled, #restart-stream-btn:disabled, #stop-btn:disabled { opacity:0.5; cursor:not-allowed; }
-    </style>
-    <div id="gate-hint" style="display:none; font-size:0.85rem; color:#666; text-align:center; line-height:1.45;">
-      Tap Start — camera opens, scans for a QR for up to 2 min, then Gemini Live takes over for voice. If the scan times out, use "Scan again" below.
+  <!-- ======== Main screen ======== -->
+  <div id="main-screen">
+    <div id="toolbar">
+      <div id="status-dot"></div>
+      <div id="status-text">
+        <div id="status-label">Starting…</div>
+        <div id="status-detail"></div>
+      </div>
+      <div id="status-chip">IDLE</div>
+    </div>
+
+    <div id="action-bar">
+      <button id="stop-session-btn" class="primary" style="display:none;">Stop session</button>
+      <button id="rescan-btn" class="warn" style="display:none;">Retry scanning</button>
+      <span id="action-empty" class="empty"></span>
+    </div>
+
+    <div id="viewer">
+      <div id="iframe-player"><iframe id="preview-iframe" allow="autoplay"></iframe></div>
+      <div id="viewer-placeholder">Waiting for camera stream…</div>
+    </div>
+
+    <div id="transcript">
+      <div id="user-line"><span class="role-tag">You:</span><span id="user-text"></span></div>
+      <div id="ai-line"><span class="role-tag">AI:</span><span id="ai-text"></span></div>
     </div>
   </div>
 
-  <div id="status" style="display:none;">
-    <p>Starting up livestream<span class="dot"> ...</span></p>
-  </div>
-  <div id="iframe-player" style="display:none; width:100%; height:100%;">
-    <iframe id="preview-iframe" style="width:100%; height:100%; border:none;" allow="autoplay"></iframe>
-  </div>
-  <div id="transcript" style="position:fixed; bottom:0; left:0; right:0; min-height:72px; max-height:30vh; overflow-y:auto; background:rgba(0,0,0,0.85); color:#e5e7eb; font-size:0.95rem; padding:12px 16px; z-index:40; border-top:1px solid #1f2937; line-height:1.4;">
-    <div id="user-line" style="color:#93c5fd; margin-bottom:4px;"><span style="opacity:0.6">You:</span> <span id="user-text"></span></div>
-    <div id="ai-line" style="color:#6ee7b7;"><span style="opacity:0.6">AI:</span> <span id="ai-text"></span></div>
-  </div>
-
   <script>
-    const gateEl = document.getElementById('gate');
-    const gateHeaderEl = document.getElementById('gate-header');
-    const gateSubheaderEl = document.getElementById('gate-subheader');
-    const gateStatusEl = document.getElementById('gate-status');
+    const startScreen = document.getElementById('start-screen');
     const startBtn = document.getElementById('start-btn');
-    const gateHintEl = document.getElementById('gate-hint');
-    const statusEl = document.getElementById('status');
+    const startStatus = document.getElementById('start-status');
+
+    const mainScreen = document.getElementById('main-screen');
+    const statusDotEl = document.getElementById('status-dot');
+    const statusLabelEl = document.getElementById('status-label');
+    const statusDetailEl = document.getElementById('status-detail');
+    const statusChipEl = document.getElementById('status-chip');
+
+    const stopSessionBtn = document.getElementById('stop-session-btn');
+    const rescanBtn = document.getElementById('rescan-btn');
+    const actionEmptyEl = document.getElementById('action-empty');
+
     const iframePlayer = document.getElementById('iframe-player');
     const previewIframe = document.getElementById('preview-iframe');
-    const modeBadgeEl = document.getElementById('mode-badge');
-    const reconnectBannerEl = document.getElementById('reconnect-banner');
-    const endedBannerEl = document.getElementById('ended-banner');
-    const actionBarEl = document.getElementById('action-bar');
-    const rescanBtn = document.getElementById('rescan-btn');
-    const restartStreamBtn = document.getElementById('restart-stream-btn');
-    const stopBtn = document.getElementById('stop-btn');
+    const viewerPlaceholder = document.getElementById('viewer-placeholder');
+
     const userTextEl = document.getElementById('user-text');
     const aiTextEl = document.getElementById('ai-text');
-    const userLineEl = document.getElementById('user-line');
     const aiLineEl = document.getElementById('ai-line');
+
     let started = false;
-    let streamAttached = false;
     let startPressed = false;
+    let streamAttached = false;
     let attachedIframeUrl = null;
     let thinking = false;
 
-    const MODE_STYLES = {
-      IDLE:     { label: 'Idle',     bg: '#1f2937', fg: '#9ca3af' },
-      SCANNING: { label: 'Scanning', bg: '#78350f', fg: '#fde68a' },
-      SESSION:  { label: 'Session',  bg: '#064e3b', fg: '#6ee7b7' },
-    };
-    function renderMode(state) {
-      const s = MODE_STYLES[state] || MODE_STYLES.IDLE;
-      modeBadgeEl.textContent = s.label;
-      modeBadgeEl.style.background = s.bg;
-      modeBadgeEl.style.color = s.fg;
+    function showStartScreen() {
+      startScreen.style.display = 'flex';
+      mainScreen.style.display = 'none';
+    }
+    function showMainScreen() {
+      startScreen.style.display = 'none';
+      mainScreen.style.display = 'flex';
     }
 
-    // --- Transcript stream: show current turn (You + AI) ---
+    // ---- Status resolver: (appState, scanStatus, streamStatus, sessionEndReason) → visual ----
+    function resolveStatus(s) {
+      // Priority order: stream errors > scan outcomes > app phases.
+      if (s.appState === 'SESSION') {
+        if (s.streamStatus === 'reconnecting') {
+          return { label: 'Reconnecting stream', detail: 'Session held — voice continues', chip: 'SESSION', color: 'amber', pulsing: true };
+        }
+        if (s.streamStatus === 'error') {
+          return { label: 'Stream lost', detail: 'Voice still working', chip: 'SESSION', color: 'red', pulsing: true };
+        }
+        return { label: 'In session', detail: 'Speak to Gemini', chip: 'SESSION', color: 'green', pulsing: true };
+      }
+      if (s.appState === 'SCANNING') {
+        if (s.scanStatus === 'timeout') {
+          return { label: 'Scan timed out', detail: 'Tap Retry scanning below', chip: 'SCAN', color: 'red', pulsing: false };
+        }
+        const detail = s.sessionEndReason
+          ? 'Previous session: ' + s.sessionEndReason + ' — rescanning'
+          : (s.scanStartedAt ? formatElapsed(s.scanStartedAt) + ' elapsed' : 'Point glasses at a QR code');
+        return { label: 'Scanning for QR', detail, chip: 'SCAN', color: 'amber', pulsing: true };
+      }
+      // IDLE (during a brief transition)
+      if (s.sessionEndReason) {
+        return { label: 'Session ended', detail: s.sessionEndReason, chip: 'IDLE', color: 'neutral', pulsing: false };
+      }
+      return { label: 'Ready', detail: '', chip: 'IDLE', color: 'neutral', pulsing: false };
+    }
+    function formatElapsed(startedAt) {
+      const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const mm = Math.floor(s / 60);
+      const ss = (s % 60).toString().padStart(2, '0');
+      return mm + ':' + ss;
+    }
+    const COLOR_MAP = {
+      green:   { dot: '#10b981', chipBg: '#064e3b', chipFg: '#6ee7b7' },
+      amber:   { dot: '#f59e0b', chipBg: '#78350f', chipFg: '#fde68a' },
+      red:     { dot: '#ef4444', chipBg: '#7f1d1d', chipFg: '#fecaca' },
+      neutral: { dot: '#6b7280', chipBg: '#1f2937', chipFg: '#9ca3af' },
+    };
+    function renderStatus(s) {
+      const v = resolveStatus(s);
+      const c = COLOR_MAP[v.color] || COLOR_MAP.neutral;
+      statusDotEl.style.background = c.dot;
+      statusDotEl.style.color = c.dot;
+      statusDotEl.classList.toggle('pulsing', !!v.pulsing);
+      statusLabelEl.textContent = v.label;
+      statusDetailEl.textContent = v.detail;
+      statusChipEl.textContent = v.chip;
+      statusChipEl.style.background = c.chipBg;
+      statusChipEl.style.color = c.chipFg;
+    }
+
+    // ---- Transcript ----
     let lastTranscriptRole = null;
     function clearThinking() {
       if (thinking) {
@@ -537,7 +809,6 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     function onTranscriptEvent(ev) {
       if (ev.type === 'user') {
         if (lastTranscriptRole === 'ai') {
-          // New user turn after an AI reply — clear both lines.
           userTextEl.textContent = '';
           aiTextEl.textContent = '';
         }
@@ -545,8 +816,6 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         userTextEl.textContent += ev.text;
         lastTranscriptRole = 'user';
       } else if (ev.type === 'thinking') {
-        // User just finished speaking — show a dim placeholder until Gemini
-        // starts streaming its reply. Cleared by the next 'ai' chunk.
         if (!thinking) {
           thinking = true;
           aiTextEl.textContent = 'thinking…';
@@ -558,108 +827,56 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         aiTextEl.textContent += ev.text;
         lastTranscriptRole = 'ai';
       }
-      // turn_complete: keep the AI reply on screen until the next user turn.
     }
     try {
       const sse = new EventSource('/api/transcript/stream');
-      sse.onmessage = (e) => {
-        try { onTranscriptEvent(JSON.parse(e.data)); } catch {}
-      };
-      // EventSource auto-reconnects on error; nothing to do.
-    } catch (e) {
-      console.warn('Transcript SSE unavailable:', e);
-    }
+      sse.onmessage = (e) => { try { onTranscriptEvent(JSON.parse(e.data)); } catch {} };
+    } catch (e) { console.warn('Transcript SSE unavailable:', e); }
 
+    // ---- Gate polling (1s) ----
     async function pollGate() {
       try {
         const res = await fetch('/api/state');
         const s = await res.json();
-        renderMode(s.appState);
 
-        // --- Recovery buttons ---
-        rescanBtn.style.display = s.canRescan ? 'inline-block' : 'none';
-        restartStreamBtn.style.display = s.canRestartStream ? 'inline-block' : 'none';
-        stopBtn.style.display = s.canStartOver ? 'inline-block' : 'none';
-        const anyAction = s.canRescan || s.canRestartStream || s.canStartOver;
-        actionBarEl.style.display = anyAction ? 'flex' : 'none';
-
-        // --- Stream status banner ---
-        if (s.streamStatus === 'error') {
-          reconnectBannerEl.style.display = 'block';
-          reconnectBannerEl.textContent = 'Stream failed — tap Restart stream below';
-          reconnectBannerEl.style.background = '#7f1d1d';
-          reconnectBannerEl.style.color = '#fecaca';
-        } else if (s.streamStatus === 'reconnecting') {
-          reconnectBannerEl.style.display = 'block';
-          reconnectBannerEl.textContent = 'Reconnecting stream…';
-          reconnectBannerEl.style.background = '#7c2d12';
-          reconnectBannerEl.style.color = '#fed7aa';
-        } else {
-          reconnectBannerEl.style.display = 'none';
-        }
-
-        // --- Scan timeout hint ---
-        if (s.appState === 'SCANNING' && s.scanStatus === 'timeout') {
-          reconnectBannerEl.style.display = 'block';
-          reconnectBannerEl.textContent = 'Scan timed out — tap Scan again below';
-          reconnectBannerEl.style.background = '#78350f';
-          reconnectBannerEl.style.color = '#fde68a';
-        }
-
-        // --- Session-ended banner ---
-        if (s.sessionEndReason && !s.started) {
-          endedBannerEl.style.display = 'block';
-          endedBannerEl.textContent = 'Previous session ended: ' + s.sessionEndReason;
-        } else {
-          endedBannerEl.style.display = 'none';
-        }
-
+        // Screen switching
         if (!s.hasSession) {
-          gateHeaderEl.style.display = 'none';
-          gateSubheaderEl.style.display = 'none';
-          gateStatusEl.textContent = 'Waiting for glasses session — open the app on your glasses.';
+          showStartScreen();
           startBtn.style.display = 'none';
-          gateHintEl.style.display = 'none';
+          startStatus.textContent = 'Waiting for glasses session — open the app on your glasses.';
         } else if (!s.started) {
-          // Orchestrator may have been recreated (server flipped started → false).
-          // Reset our local flags so the Start button becomes live again.
+          // Reset if we were previously in main
           if (started) {
             started = false;
-            streamAttached = false;
-            attachedIframeUrl = null;
             startPressed = false;
             startBtn.disabled = false;
-            iframePlayer.style.display = 'none';
+            streamAttached = false;
+            attachedIframeUrl = null;
             previewIframe.src = 'about:blank';
-            statusEl.style.display = 'none';
-            gateEl.style.display = 'flex';
           }
-          gateHeaderEl.style.display = 'block';
-          gateSubheaderEl.style.display = 'block';
-          if (startPressed) {
-            gateStatusEl.textContent = 'Starting…';
-          } else {
-            gateStatusEl.textContent = s.sessionEndReason ? 'Tap Start to begin a new session.' : 'Ready to start.';
-            startBtn.style.display = 'inline-block';
-            gateHintEl.style.display = 'block';
-          }
+          showStartScreen();
+          startBtn.style.display = 'inline-block';
+          startStatus.textContent = startPressed ? 'Starting…' : 'Ready to start.';
         } else {
-          // User tapped Start — hide the gate, show the player flow.
-          // Keep pollGate running so the mode badge keeps updating as the
-          // orchestrator transitions SCANNING → SESSION.
-          gateEl.style.display = 'none';
+          showMainScreen();
           if (!started) {
             started = true;
-            statusEl.style.display = 'block';
-            poll();
+            startPressed = false;
           }
+          renderStatus(s);
+
+          // Action buttons
+          stopSessionBtn.style.display = s.canStopSession ? 'inline-block' : 'none';
+          rescanBtn.style.display = s.canRescan ? 'inline-block' : 'none';
+          actionEmptyEl.textContent = (!s.canStopSession && !s.canRescan) ? 'No actions available' : '';
         }
       } catch (e) {
-        gateStatusEl.textContent = 'Connection error: ' + e;
+        startStatus.textContent = 'Connection error: ' + e;
       }
       setTimeout(pollGate, 1000);
     }
 
+    // ---- Actions ----
     async function postAction(path, btn) {
       btn.disabled = true;
       try {
@@ -671,67 +888,64 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       } catch (e) {
         console.warn(path + ' error:', e);
       } finally {
-        // Re-enable shortly; pollGate will hide the button if no longer valid.
         setTimeout(() => { btn.disabled = false; }, 1500);
       }
     }
+    stopSessionBtn.addEventListener('click', () => postAction('/api/stop-session', stopSessionBtn));
     rescanBtn.addEventListener('click', () => postAction('/api/rescan', rescanBtn));
-    restartStreamBtn.addEventListener('click', () => postAction('/api/restart-stream', restartStreamBtn));
-    stopBtn.addEventListener('click', () => postAction('/api/stop', stopBtn));
 
     startBtn.addEventListener('click', async () => {
       if (startPressed) return;
       startPressed = true;
       startBtn.disabled = true;
-      gateStatusEl.textContent = 'Starting…';
+      startStatus.textContent = 'Starting…';
       try {
         const res = await fetch('/api/start', { method: 'POST' });
         const body = await res.json();
-        console.log('Start response:', body);
         if (!res.ok) {
           startPressed = false;
           startBtn.disabled = false;
-          gateStatusEl.textContent = body.error || 'Start failed';
+          startStatus.textContent = body.error || 'Start failed';
         }
       } catch (e) {
         startPressed = false;
         startBtn.disabled = false;
-        gateStatusEl.textContent = 'Start error: ' + e;
+        startStatus.textContent = 'Start error: ' + e;
       }
     });
 
     pollGate();
 
-    async function poll() {
+    // ---- Cloudflare preview iframe polling (2s) ----
+    async function pollStream() {
       try {
         const res = await fetch('/api/stream');
         const data = await res.json();
-        console.log('Poll: status=' + data.status + ' iframe=' + !!data.iframeUrl);
-
         if (data.status === 'active' && data.iframeUrl) {
           if (!streamAttached || data.iframeUrl !== attachedIframeUrl) {
             streamAttached = true;
             attachedIframeUrl = data.iframeUrl;
-            console.log('Attaching Cloudflare preview iframe');
-            statusEl.style.display = 'none';
+            viewerPlaceholder.style.display = 'none';
             iframePlayer.style.display = 'block';
             previewIframe.src = data.iframeUrl;
           }
-        } else if (data.status === 'reconnecting') {
-          // Preview iframe from the old stream is dead. Clear it and show the
-          // spinner until a new iframeUrl arrives.
+        } else if (data.status === 'reconnecting' || data.status === 'error') {
           if (streamAttached) {
             streamAttached = false;
             attachedIframeUrl = null;
             iframePlayer.style.display = 'none';
             previewIframe.src = 'about:blank';
-            statusEl.style.display = 'block';
+            viewerPlaceholder.style.display = 'flex';
+            viewerPlaceholder.textContent = data.status === 'reconnecting' ? 'Reconnecting stream…' : 'Stream unavailable';
           }
+        } else if (data.status === 'idle' || data.status === 'starting') {
+          viewerPlaceholder.style.display = 'flex';
+          viewerPlaceholder.textContent = 'Waiting for camera stream…';
         }
-      } catch (e) { console.warn('Poll error:', e); }
-
-      setTimeout(poll, 2000);
+      } catch (e) { /* quiet */ }
+      setTimeout(pollStream, 2000);
     }
+    pollStream();
   </script>
 </body>
 </html>`;

@@ -29,12 +29,6 @@ export class SessionOrchestrator {
   private card: ContextCard | null = null;
   private frameRelay: FrameRelay | null = null;
 
-  /**
-   * Called when the session ends (Gemini disconnect, etc.) so the app layer
-   * can recreate a fresh orchestrator. Assigned by index.ts#onSession.
-   */
-  onEnded?: (reason: string) => void;
-
   private scanCountdownTimer: ReturnType<typeof setInterval> | null = null;
 
   // Audio output: Gemini Live PCM16 → Mentra AudioOutputStream → glasses speaker.
@@ -155,11 +149,11 @@ export class SessionOrchestrator {
       console.warn(`[Session] Scan timed out — awaiting manual rescan: ${msg}`);
       // Long duration so the message persists until user acts. SDK will
       // refresh if we call showText again (via rescan).
-      showText(this.session, 'Scan timeout — rescan on phone', 600_000);
+      showText(this.session, 'Scan timeout — tap Retry on phone', 600_000);
     }
   }
 
-  /** Called by /api/rescan when user taps "Scan again" after a timeout. */
+  /** Called by /api/rescan when user taps "Retry scanning" after a timeout. */
   async rescan(): Promise<void> {
     if (this.state !== AppState.SCANNING) {
       throw new Error(`rescan invalid in state ${this.state}`);
@@ -175,6 +169,44 @@ export class SessionOrchestrator {
     this.frameRelay = new FrameRelay();
     await this.attemptScan();
     if (this.card) {
+      await this.startGeminiSession(this.card);
+    }
+  }
+
+  /**
+   * User pressed "Stop session" during a live Gemini session. End Gemini,
+   * close audio, swap the frame relay, and go back into scan mode so the
+   * next QR can start a fresh session.
+   */
+  async stopSession(): Promise<void> {
+    if (this.state !== AppState.SESSION) {
+      throw new Error(`stopSession invalid in state ${this.state}`);
+    }
+    console.log('[Session] User stopped session — returning to scan mode');
+    streamState.sessionEndReason = 'user_stop';
+    // Transition first so handleDisconnect's state===SESSION guard no-ops
+    // when gemini.disconnect() fires its onDisconnected callback below.
+    this.transition(AppState.SCANNING);
+    await this.restartScanPhase();
+  }
+
+  /**
+   * Tear down the Gemini half of the session (disconnect, close audio,
+   * clear card), reset the frame relay, and start a fresh scan. Used by
+   * both stopSession() (user-initiated) and handleDisconnect() (Gemini
+   * dropped). Caller is expected to have already transitioned to SCANNING.
+   */
+  private async restartScanPhase(): Promise<void> {
+    safely('gemini.disconnect', () => this.gemini.disconnect());
+    safely('audio.close', () => this.closeAudioStream());
+    this.card = null;
+    this.frameRelay?.stop();
+    this.frameRelay = new FrameRelay();
+    await this.attemptScan();
+    if (this.card) {
+      // Successful rescan → clear the prior end reason before the new
+      // session takes over so the toolbar doesn't keep showing it.
+      streamState.sessionEndReason = null;
       await this.startGeminiSession(this.card);
     }
   }
@@ -802,12 +834,16 @@ export class SessionOrchestrator {
     if (this.state === AppState.SESSION) {
       const r = reason ?? 'gemini_disconnect';
       streamState.sessionEndReason = r;
-      showText(this.session, `Session ended (${r})`, 8000);
-      this.transition(AppState.IDLE);
-      // Hand off to app layer so it can cleanupSession + create a fresh
-      // orchestrator. Fire in a microtask so this handler returns first.
-      const cb = this.onEnded;
-      if (cb) queueMicrotask(() => cb(r));
+      // Auto-return to scan mode. User doesn't have to do anything — next
+      // QR starts a fresh session. If they wanted to stop the whole thing
+      // they'd close the app on the glasses.
+      console.log(`[Session] Gemini disconnected (${r}) — auto-restarting scan`);
+      this.transition(AppState.SCANNING);
+      queueMicrotask(() => {
+        this.restartScanPhase().catch((err) =>
+          console.error('[Session] auto-restartScanPhase failed:', err),
+        );
+      });
     }
   }
 
