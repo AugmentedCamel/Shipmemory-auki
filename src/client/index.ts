@@ -24,7 +24,22 @@ export const streamState: {
   latestJpeg: Buffer | null;
   latestJpegTime: number;
   frameCount: number;
-} = { hlsUrl: null, webrtcUrl: null, previewUrl: null, dashUrl: null, status: 'idle', latestJpeg: null, latestJpegTime: 0, frameCount: 0 };
+  scanStatus: 'idle' | 'active' | 'timeout';
+  scanStartedAt: number | null;
+  sessionEndReason: string | null;
+} = {
+  hlsUrl: null,
+  webrtcUrl: null,
+  previewUrl: null,
+  dashUrl: null,
+  status: 'idle',
+  latestJpeg: null,
+  latestJpegTime: 0,
+  frameCount: 0,
+  scanStatus: 'idle',
+  scanStartedAt: null,
+  sessionEndReason: null,
+};
 
 const DISCONNECT_GRACE_MS = 30_000;
 
@@ -61,12 +76,23 @@ class ShipMemoryApp extends AppServer {
     this.get('/api/state', (c) => {
       const sessionId = this.orchestrators.keys().next().value ?? null;
       const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
+      const appState = orchestrator ? orchestrator.getState() : 'IDLE';
+      const started = sessionId ? this.startedSessions.has(sessionId) : false;
+      const canRescan = appState === 'SCANNING' && streamState.scanStatus === 'timeout';
+      const canRestartStream = appState === 'SESSION';
+      const canStartOver = started && (!!streamState.sessionEndReason || appState !== 'IDLE');
       return c.json({
         sessionId,
         hasSession: !!sessionId,
-        started: sessionId ? this.startedSessions.has(sessionId) : false,
+        started,
         streamStatus: streamState.status,
-        appState: orchestrator ? orchestrator.getState() : 'IDLE',
+        appState,
+        scanStatus: streamState.scanStatus,
+        scanStartedAt: streamState.scanStartedAt,
+        sessionEndReason: streamState.sessionEndReason,
+        canRescan,
+        canRestartStream,
+        canStartOver,
       });
     });
 
@@ -87,6 +113,7 @@ class ShipMemoryApp extends AppServer {
         return c.json({ error: 'Orchestrator missing for session' }, 404);
       }
       this.startedSessions.add(sessionId);
+      streamState.sessionEndReason = null;
       console.log(`[ShipMemory] User triggered start via webview for ${sessionId}`);
       // Fire-and-forget. Errors get caught and run cleanupSession.
       orchestrator.start().catch((err) => {
@@ -94,6 +121,56 @@ class ShipMemoryApp extends AppServer {
         this.cleanupSession(sessionId, 'start-failed');
       });
       return c.json({ status: 'starting', sessionId });
+    });
+
+    // Manual rescan: valid only when a scan has timed out.
+    this.post('/api/rescan', (c) => {
+      const sessionId = this.orchestrators.keys().next().value ?? null;
+      const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
+      if (!orchestrator) return c.json({ error: 'No active session' }, 404);
+      if (orchestrator.getState() !== 'SCANNING' || streamState.scanStatus !== 'timeout') {
+        return c.json({ error: `Cannot rescan in state=${orchestrator.getState()} scanStatus=${streamState.scanStatus}` }, 409);
+      }
+      console.log(`[ShipMemory] User triggered rescan for ${sessionId}`);
+      orchestrator.rescan().catch((err) => {
+        console.error(`[ShipMemory] rescan failed for ${sessionId}:`, err);
+      });
+      return c.json({ status: 'rescanning', sessionId });
+    });
+
+    // Manual stream restart: valid during SESSION. Tears the WHEP/Cloudflare
+    // stream down and spins a fresh one without touching Gemini.
+    this.post('/api/restart-stream', (c) => {
+      const sessionId = this.orchestrators.keys().next().value ?? null;
+      const orchestrator = sessionId ? this.orchestrators.get(sessionId) : null;
+      if (!orchestrator) return c.json({ error: 'No active session' }, 404);
+      if (orchestrator.getState() !== 'SESSION') {
+        return c.json({ error: `Cannot restart stream in state=${orchestrator.getState()}` }, 409);
+      }
+      console.log(`[ShipMemory] User triggered stream restart for ${sessionId}`);
+      orchestrator.restartStream().catch((err) => {
+        console.error(`[ShipMemory] restartStream failed for ${sessionId}:`, err);
+        streamState.status = 'error';
+      });
+      return c.json({ status: 'restarting', sessionId });
+    });
+
+    // User-initiated stop: tears the orchestrator down and recreates a
+    // fresh one so the Start button reappears in the webview.
+    this.post('/api/stop', (c) => {
+      const sessionId = this.orchestrators.keys().next().value ?? null;
+      if (!sessionId) return c.json({ error: 'No active session' }, 404);
+      console.log(`[ShipMemory] User triggered stop for ${sessionId}`);
+      // Trigger the orchestrator's onEnded path so a fresh orchestrator is
+      // stood up automatically (same flow as Gemini disconnect).
+      const orchestrator = this.orchestrators.get(sessionId);
+      if (orchestrator?.onEnded) {
+        streamState.sessionEndReason = 'user_stop';
+        orchestrator.onEnded('user_stop');
+      } else {
+        this.cleanupSession(sessionId, 'user_stop');
+      }
+      return c.json({ status: 'stopped', sessionId });
     });
 
     // SSE stream of Gemini transcription events (user speech + AI reply).
@@ -156,9 +233,25 @@ class ShipMemoryApp extends AppServer {
       this.orchestrators.delete(sessionId);
     }
 
-    session.layouts.showTextWall('Open the webview and tap Start');
+    session.layouts.showTextWall('Waiting for start — tap on phone');
 
-    const orchestrator = new SessionOrchestrator(session, sessionId, env);
+    // When Gemini disconnects the orchestrator flips itself to IDLE; we
+    // tear it down and stand up a fresh one so the webview's next poll
+    // sees started=false and can offer a new Start button without the
+    // user having to relaunch the app. Factory recreates itself after
+    // each end so repeated restart cycles all wire onEnded correctly.
+    const makeOrchestrator = (): SessionOrchestrator => {
+      const o = new SessionOrchestrator(session, sessionId, env);
+      o.onEnded = (reason) => {
+        if (this.orchestrators.get(sessionId) !== o) return;
+        console.log(`[ShipMemory] Session ${sessionId} ended (${reason}) — recreating orchestrator`);
+        this.cleanupSession(sessionId, `session_ended:${reason}`);
+        streamState.sessionEndReason = reason;
+        this.orchestrators.set(sessionId, makeOrchestrator());
+      };
+      return o;
+    };
+    const orchestrator = makeOrchestrator();
     this.orchestrators.set(sessionId, orchestrator);
     this.startedSessions.delete(sessionId);
 
@@ -246,6 +339,11 @@ class ShipMemoryApp extends AppServer {
     streamState.latestJpeg = null;
     streamState.latestJpegTime = 0;
     streamState.frameCount = 0;
+    streamState.scanStatus = 'idle';
+    streamState.scanStartedAt = null;
+    // NOTE: sessionEndReason is deliberately NOT cleared here — we want the
+    // next /api/state poll to show the reason so the webview can render its
+    // "Previous session ended: X" banner until the user taps Start.
   }
 }
 
@@ -354,15 +452,25 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 <body>
   <div id="mode-badge" style="position:fixed; top:12px; left:50%; transform:translateX(-50%); z-index:50; padding:6px 12px; border-radius:999px; font-size:0.8rem; font-weight:600; background:#1f2937; color:#9ca3af; letter-spacing:0.05em;">Idle</div>
   <div id="reconnect-banner" style="display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); z-index:49; padding:8px 18px; border-radius:10px; font-size:0.85rem; font-weight:600; background:#7c2d12; color:#fed7aa; letter-spacing:0.02em; box-shadow:0 4px 12px rgba(0,0,0,0.3);">Reconnecting stream…</div>
+  <div id="ended-banner" style="display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); z-index:48; padding:8px 18px; border-radius:10px; font-size:0.85rem; font-weight:600; background:#1e3a8a; color:#dbeafe; letter-spacing:0.02em; box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
 
-  <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:20px;">
+  <div id="action-bar" style="display:none; position:fixed; top:96px; left:50%; transform:translateX(-50%); z-index:47; display:flex; gap:8px; flex-wrap:wrap; justify-content:center; max-width:90vw;">
+    <button id="rescan-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#d97706; color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Scan again</button>
+    <button id="restart-stream-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#7c2d12; color:#fed7aa; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Restart stream</button>
+    <button id="stop-btn" style="display:none; padding:10px 18px; font-size:0.9rem; background:#374151; color:#e5e7eb; border:none; border-radius:10px; cursor:pointer; font-weight:600;">Start new session</button>
+  </div>
+
+  <div id="gate" style="display:flex; flex-direction:column; align-items:center; gap:16px; max-width:420px; padding:0 20px;">
+    <div id="gate-header" style="display:none; font-size:1.4rem; color:#e5e7eb; text-align:center; font-weight:600;">ShipMemory</div>
+    <div id="gate-subheader" style="display:none; font-size:1rem; color:#9ca3af; text-align:center;">Scan a QR to start a voice session.</div>
     <div id="gate-status" style="font-size:1.1rem; color:#888; text-align:center;">Checking session…</div>
     <button id="start-btn" style="display:none; padding:18px 48px; font-size:1.3rem; background:#10b981; color:#fff; border:none; border-radius:12px; cursor:pointer; font-weight:600; transition:opacity 0.2s;">Start</button>
     <style>
       #start-btn:disabled { opacity:0.4; cursor:not-allowed; }
+      #rescan-btn:disabled, #restart-stream-btn:disabled, #stop-btn:disabled { opacity:0.5; cursor:not-allowed; }
     </style>
-    <div id="gate-hint" style="display:none; font-size:0.9rem; color:#666; text-align:center; max-width:340px; line-height:1.45;">
-      Tap Start to begin. The camera starts, looks for a QR code for up to 2 minutes, then Gemini Live takes over for voice. The camera stays off until you tap.
+    <div id="gate-hint" style="display:none; font-size:0.85rem; color:#666; text-align:center; line-height:1.45;">
+      Tap Start — camera opens, scans for a QR for up to 2 min, then Gemini Live takes over for voice. If the scan times out, use "Scan again" below.
     </div>
   </div>
 
@@ -379,6 +487,8 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 
   <script>
     const gateEl = document.getElementById('gate');
+    const gateHeaderEl = document.getElementById('gate-header');
+    const gateSubheaderEl = document.getElementById('gate-subheader');
     const gateStatusEl = document.getElementById('gate-status');
     const startBtn = document.getElementById('start-btn');
     const gateHintEl = document.getElementById('gate-hint');
@@ -387,12 +497,20 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
     const previewIframe = document.getElementById('preview-iframe');
     const modeBadgeEl = document.getElementById('mode-badge');
     const reconnectBannerEl = document.getElementById('reconnect-banner');
+    const endedBannerEl = document.getElementById('ended-banner');
+    const actionBarEl = document.getElementById('action-bar');
+    const rescanBtn = document.getElementById('rescan-btn');
+    const restartStreamBtn = document.getElementById('restart-stream-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const userTextEl = document.getElementById('user-text');
     const aiTextEl = document.getElementById('ai-text');
+    const userLineEl = document.getElementById('user-line');
+    const aiLineEl = document.getElementById('ai-line');
     let started = false;
     let streamAttached = false;
     let startPressed = false;
     let attachedIframeUrl = null;
+    let thinking = false;
 
     const MODE_STYLES = {
       IDLE:     { label: 'Idle',     bg: '#1f2937', fg: '#9ca3af' },
@@ -408,6 +526,14 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
 
     // --- Transcript stream: show current turn (You + AI) ---
     let lastTranscriptRole = null;
+    function clearThinking() {
+      if (thinking) {
+        thinking = false;
+        aiTextEl.textContent = '';
+        aiLineEl.style.opacity = '1';
+        aiLineEl.style.fontStyle = 'normal';
+      }
+    }
     function onTranscriptEvent(ev) {
       if (ev.type === 'user') {
         if (lastTranscriptRole === 'ai') {
@@ -415,9 +541,20 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
           userTextEl.textContent = '';
           aiTextEl.textContent = '';
         }
+        clearThinking();
         userTextEl.textContent += ev.text;
         lastTranscriptRole = 'user';
+      } else if (ev.type === 'thinking') {
+        // User just finished speaking — show a dim placeholder until Gemini
+        // starts streaming its reply. Cleared by the next 'ai' chunk.
+        if (!thinking) {
+          thinking = true;
+          aiTextEl.textContent = 'thinking…';
+          aiLineEl.style.opacity = '0.55';
+          aiLineEl.style.fontStyle = 'italic';
+        }
       } else if (ev.type === 'ai') {
+        clearThinking();
         aiTextEl.textContent += ev.text;
         lastTranscriptRole = 'ai';
       }
@@ -438,26 +575,71 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
         const res = await fetch('/api/state');
         const s = await res.json();
         renderMode(s.appState);
-        reconnectBannerEl.style.display = s.streamStatus === 'reconnecting' ? 'block' : 'none';
+
+        // --- Recovery buttons ---
+        rescanBtn.style.display = s.canRescan ? 'inline-block' : 'none';
+        restartStreamBtn.style.display = s.canRestartStream ? 'inline-block' : 'none';
+        stopBtn.style.display = s.canStartOver ? 'inline-block' : 'none';
+        const anyAction = s.canRescan || s.canRestartStream || s.canStartOver;
+        actionBarEl.style.display = anyAction ? 'flex' : 'none';
+
+        // --- Stream status banner ---
         if (s.streamStatus === 'error') {
           reconnectBannerEl.style.display = 'block';
-          reconnectBannerEl.textContent = 'Stream failed to reconnect';
+          reconnectBannerEl.textContent = 'Stream failed — tap Restart stream below';
           reconnectBannerEl.style.background = '#7f1d1d';
           reconnectBannerEl.style.color = '#fecaca';
         } else if (s.streamStatus === 'reconnecting') {
+          reconnectBannerEl.style.display = 'block';
           reconnectBannerEl.textContent = 'Reconnecting stream…';
           reconnectBannerEl.style.background = '#7c2d12';
           reconnectBannerEl.style.color = '#fed7aa';
+        } else {
+          reconnectBannerEl.style.display = 'none';
         }
+
+        // --- Scan timeout hint ---
+        if (s.appState === 'SCANNING' && s.scanStatus === 'timeout') {
+          reconnectBannerEl.style.display = 'block';
+          reconnectBannerEl.textContent = 'Scan timed out — tap Scan again below';
+          reconnectBannerEl.style.background = '#78350f';
+          reconnectBannerEl.style.color = '#fde68a';
+        }
+
+        // --- Session-ended banner ---
+        if (s.sessionEndReason && !s.started) {
+          endedBannerEl.style.display = 'block';
+          endedBannerEl.textContent = 'Previous session ended: ' + s.sessionEndReason;
+        } else {
+          endedBannerEl.style.display = 'none';
+        }
+
         if (!s.hasSession) {
+          gateHeaderEl.style.display = 'none';
+          gateSubheaderEl.style.display = 'none';
           gateStatusEl.textContent = 'Waiting for glasses session — open the app on your glasses.';
           startBtn.style.display = 'none';
           gateHintEl.style.display = 'none';
         } else if (!s.started) {
+          // Orchestrator may have been recreated (server flipped started → false).
+          // Reset our local flags so the Start button becomes live again.
+          if (started) {
+            started = false;
+            streamAttached = false;
+            attachedIframeUrl = null;
+            startPressed = false;
+            startBtn.disabled = false;
+            iframePlayer.style.display = 'none';
+            previewIframe.src = 'about:blank';
+            statusEl.style.display = 'none';
+            gateEl.style.display = 'flex';
+          }
+          gateHeaderEl.style.display = 'block';
+          gateSubheaderEl.style.display = 'block';
           if (startPressed) {
             gateStatusEl.textContent = 'Starting…';
           } else {
-            gateStatusEl.textContent = 'Ready to start.';
+            gateStatusEl.textContent = s.sessionEndReason ? 'Tap Start to begin a new session.' : 'Ready to start.';
             startBtn.style.display = 'inline-block';
             gateHintEl.style.display = 'block';
           }
@@ -477,6 +659,25 @@ const WEBVIEW_HTML = `<!DOCTYPE html>
       }
       setTimeout(pollGate, 1000);
     }
+
+    async function postAction(path, btn) {
+      btn.disabled = true;
+      try {
+        const res = await fetch(path, { method: 'POST' });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          console.warn(path + ' failed:', body.error || res.status);
+        }
+      } catch (e) {
+        console.warn(path + ' error:', e);
+      } finally {
+        // Re-enable shortly; pollGate will hide the button if no longer valid.
+        setTimeout(() => { btn.disabled = false; }, 1500);
+      }
+    }
+    rescanBtn.addEventListener('click', () => postAction('/api/rescan', rescanBtn));
+    restartStreamBtn.addEventListener('click', () => postAction('/api/restart-stream', restartStreamBtn));
+    stopBtn.addEventListener('click', () => postAction('/api/stop', stopBtn));
 
     startBtn.addEventListener('click', async () => {
       if (startPressed) return;

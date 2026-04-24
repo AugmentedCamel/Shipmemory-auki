@@ -29,6 +29,14 @@ export class SessionOrchestrator {
   private card: ContextCard | null = null;
   private frameRelay: FrameRelay | null = null;
 
+  /**
+   * Called when the session ends (Gemini disconnect, etc.) so the app layer
+   * can recreate a fresh orchestrator. Assigned by index.ts#onSession.
+   */
+  onEnded?: (reason: string) => void;
+
+  private scanCountdownTimer: ReturnType<typeof setInterval> | null = null;
+
   // Audio output: Gemini Live PCM16 → Mentra AudioOutputStream → glasses speaker.
   // Lazily created on first audio chunk; null between turns.
   private audioOutPromise: Promise<AudioOutputStream> | null = null;
@@ -54,6 +62,7 @@ export class SessionOrchestrator {
       onSpeechEnd: (speechEndAt, activityEndAt) => {
         this.turnSpeechEndAt = speechEndAt;
         this.turnActivityEndAt = activityEndAt;
+        transcriptEvents.emit('event', { type: 'thinking' });
       },
       onToolCall: (calls) => this.handleToolCalls(calls),
       onToolCallCancellation: (ids) => console.log(`[Gemini] Tool calls cancelled: ${ids.join(', ')}`),
@@ -85,10 +94,9 @@ export class SessionOrchestrator {
     console.log(`[Session] Starting orchestrator (provider: ${this.contextProvider.constructor.name})`);
 
     this.transition(AppState.SCANNING);
-    showText(this.session, 'Loading context…');
+    showText(this.session, 'Loading…');
 
     const needsCamera = this.contextProvider instanceof ShipMemoryService;
-    let card: ContextCard;
 
     if (needsCamera) {
       // Camera must start FIRST so QR scanner has frames to scan
@@ -100,23 +108,95 @@ export class SessionOrchestrator {
       // sends JPEGs to Gemini during SESSION. Runs until state == IDLE.
       this.runWhepLoop().catch((err) => console.error('[Session] WHEP loop error:', err));
 
-      showText(this.session, 'Point at a QR code…');
-      card = await this.scanWithTimeout(this.frameRelay);
-      this.frameRelay.stop();
+      await this.attemptScan();
+      // On timeout, attemptScan returns without throwing; orchestrator stays
+      // in SCANNING with scanStatus='timeout' waiting for /api/rescan.
+      if (!this.card) return;
     } else {
       const emptyFrames = (async function* () {})();
-      card = await this.contextProvider.scan(emptyFrames);
+      const card = await this.contextProvider.scan(emptyFrames);
+      this.card = card;
     }
 
-    this.card = card;
-    console.log(`[Session] Got context card: ${card.body.slice(0, 80)}…`);
+    console.log(`[Session] Got context card: ${this.card!.body.slice(0, 80)}…`);
 
-    await this.startGeminiSession(card);
+    await this.startGeminiSession(this.card!);
 
     // For non-camera providers, start camera in background now so Gemini gets video.
     // For camera-first path, WHEP loop is already running and will pick up SESSION mode.
     if (!needsCamera) {
       this.startCamera();
+    }
+  }
+
+  /**
+   * One scan attempt with timeout + live countdown on glasses. On success,
+   * sets this.card and starts Gemini. On timeout, flips scanStatus to
+   * 'timeout' and shows a persistent error message — does NOT throw, so
+   * the orchestrator stays in SCANNING waiting for /api/rescan.
+   */
+  private async attemptScan(): Promise<void> {
+    if (!this.frameRelay) throw new Error('attemptScan called without frameRelay');
+    streamState.scanStatus = 'active';
+    streamState.scanStartedAt = Date.now();
+    this.startScanCountdown();
+    try {
+      const card = await this.scanWithTimeout(this.frameRelay);
+      this.stopScanCountdown();
+      this.frameRelay.stop();
+      streamState.scanStatus = 'idle';
+      streamState.scanStartedAt = null;
+      this.card = card;
+      showText(this.session, 'QR found ✓', 2000);
+    } catch (err) {
+      this.stopScanCountdown();
+      streamState.scanStatus = 'timeout';
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Session] Scan timed out — awaiting manual rescan: ${msg}`);
+      // Long duration so the message persists until user acts. SDK will
+      // refresh if we call showText again (via rescan).
+      showText(this.session, 'Scan timeout — rescan on phone', 600_000);
+    }
+  }
+
+  /** Called by /api/rescan when user taps "Scan again" after a timeout. */
+  async rescan(): Promise<void> {
+    if (this.state !== AppState.SCANNING) {
+      throw new Error(`rescan invalid in state ${this.state}`);
+    }
+    if (streamState.scanStatus !== 'timeout') {
+      throw new Error(`rescan invalid when scanStatus=${streamState.scanStatus}`);
+    }
+    console.log('[Session] Rescan requested');
+    // Old relay is dead (scan() threw and exited its consumer loop). Swap in
+    // a fresh one — the WHEP loop reads this.frameRelay by reference on each
+    // iteration, so new frames start flowing to the new relay immediately.
+    this.frameRelay?.stop();
+    this.frameRelay = new FrameRelay();
+    await this.attemptScan();
+    if (this.card) {
+      await this.startGeminiSession(this.card);
+    }
+  }
+
+  private startScanCountdown(): void {
+    this.stopScanCountdown();
+    const startedAt = streamState.scanStartedAt ?? Date.now();
+    const tick = () => {
+      if (this.state !== AppState.SCANNING || streamState.scanStatus !== 'active') return;
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const mm = Math.floor(elapsed / 60);
+      const ss = (elapsed % 60).toString().padStart(2, '0');
+      showText(this.session, `Scanning QR… (${mm}:${ss})`, 5000);
+    };
+    tick();
+    this.scanCountdownTimer = setInterval(tick, 2000);
+  }
+
+  private stopScanCountdown(): void {
+    if (this.scanCountdownTimer) {
+      clearInterval(this.scanCountdownTimer);
+      this.scanCountdownTimer = null;
     }
   }
 
@@ -186,14 +266,20 @@ export class SessionOrchestrator {
       this.restartStream().catch((err) => {
         console.error('[Session] restartStream failed:', err);
         streamState.status = 'error';
+        showText(this.session, 'Stream lost — voice only', 5000);
       });
     }
   }
 
   /** Tear down the current WHEP/stream and ask Mentra for a fresh one. */
-  private async restartStream(): Promise<void> {
+  async restartStream(): Promise<void> {
+    if (this.restartInFlight) {
+      console.warn('[Session] restartStream requested while already in flight — ignoring');
+      return;
+    }
     this.restartInFlight = true;
     streamState.status = 'reconnecting';
+    showText(this.session, 'Restarting stream…', 5000);
     // Clear the stale cached frame so Gemini's speech-start/end handlers
     // don't re-send it while we reconnect.
     streamState.latestJpeg = null;
@@ -232,7 +318,7 @@ export class SessionOrchestrator {
 
   private async startGeminiSession(card: ContextCard): Promise<void> {
     this.transition(AppState.SESSION);
-    showText(this.session, 'Connecting to Gemini…');
+    showText(this.session, 'Gemini connecting…');
 
     const systemPrompt = buildSystemPrompt(card);
     await this.gemini.connect(systemPrompt, card);
@@ -244,7 +330,7 @@ export class SessionOrchestrator {
     // without a "missing opening words" gap. Awaited deliberately.
     await this.ensureAudioStream();
 
-    showText(this.session, 'Ready — speak to begin');
+    showText(this.session, 'Ready');
 
     // Wire mic audio → Gemini
     subscribeMic(this.session, (pcm) => {
@@ -714,8 +800,14 @@ export class SessionOrchestrator {
   private handleDisconnect(reason?: string): void {
     console.log(`[Session] Disconnected: ${reason ?? 'unknown'}`);
     if (this.state === AppState.SESSION) {
-      showText(this.session, 'Session ended');
+      const r = reason ?? 'gemini_disconnect';
+      streamState.sessionEndReason = r;
+      showText(this.session, `Session ended (${r})`, 8000);
       this.transition(AppState.IDLE);
+      // Hand off to app layer so it can cleanupSession + create a fresh
+      // orchestrator. Fire in a microtask so this handler returns first.
+      const cb = this.onEnded;
+      if (cb) queueMicrotask(() => cb(r));
     }
   }
 
@@ -728,6 +820,7 @@ export class SessionOrchestrator {
     console.log(`[Session] Destroying orchestrator (trigger: ${reason}) — cleaning up`);
     this.transition(AppState.IDLE);
 
+    safely('scanCountdown.stop',  () => this.stopScanCountdown());
     safely('gemini.disconnect',   () => this.gemini.disconnect());
     safely('whep.stop',           () => this.whepClient.stop());
     safely('relay.stop',          () => this.frameRelay?.stop());
