@@ -60,22 +60,22 @@ export class ShipMemoryService implements ContextProvider {
 
   private async resolve(raw: string): Promise<ContextCard> {
     const decoded = decodeSM1(raw);
+    const normalized = normalizeQRPayload(decoded);
 
-    // URL payload: fetch card from bridge (allowlist enforced inside fetchContextCard)
-    if (decoded.startsWith('https://')) {
-      console.log(`[QR] Fetching card from URL: ${decoded.slice(0, 120)}`);
-      const card = await fetchContextCard(decoded, this.apiKey);
+    if (normalized.kind === 'url') {
+      console.log(`[QR] Fetching card from URL: ${normalized.url.slice(0, 120)}`);
+      const card = await fetchContextCard(normalized.url, this.apiKey);
       return sanitizeCardUrls(card);
     }
 
     // Inline JSON card
     try {
-      const json = JSON.parse(decoded);
+      const json = JSON.parse(normalized.text);
       return sanitizeCardUrls(parseContextCardJSON(json));
     } catch {
       // Plain text — use as body directly
       return {
-        body: decoded,
+        body: normalized.text,
         tools: [],
         execute_url: null,
         session_id: null,
@@ -83,6 +83,30 @@ export class ShipMemoryService implements ContextProvider {
       };
     }
   }
+}
+
+type NormalizedPayload =
+  | { kind: 'url'; url: string }
+  | { kind: 'inline'; text: string };
+
+/** ShipMemory Protocol §3.2.1 — normalize a decoded QR payload. */
+export function normalizeQRPayload(decoded: string): NormalizedPayload {
+  // Rule 1: already a URL
+  if (/^https?:\/\//i.test(decoded)) {
+    return { kind: 'url', url: decoded };
+  }
+  // Rule 3: bare short code → oneshot.glass/c/{code}
+  if (/^[A-Za-z0-9]{6,10}$/.test(decoded)) {
+    return { kind: 'url', url: `https://oneshot.glass/c/${decoded.toLowerCase()}` };
+  }
+  // Rule 4: host/path without scheme — prepend https://, lowercase host + path
+  const hostPathMatch = decoded.match(/^([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(\/\S*)$/);
+  if (hostPathMatch) {
+    const [, host, path] = hostPathMatch;
+    return { kind: 'url', url: `https://${host.toLowerCase()}${path.toLowerCase()}` };
+  }
+  // Rule 5: inline (JSON or plain text)
+  return { kind: 'inline', text: decoded };
 }
 
 /** Null out execute_url/trace_url that fail the allowlist — keep the rest of the card usable. */
