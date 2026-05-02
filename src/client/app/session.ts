@@ -12,6 +12,7 @@ import { MockShipMemoryService, HardcodedUrlProvider } from '../shipmemory/mock.
 import type { ContextCard, ContextProvider } from '../shipmemory/types.js';
 import type { env as Env } from '../config/env.js';
 import { streamState, transcriptEvents } from '../index.js';
+import { playSfx } from './sfx.js';
 
 const TOOL_TIMEOUT_MS = 10_000;
 const SCAN_TIMEOUT_MS = 120_000;
@@ -30,6 +31,7 @@ export class SessionOrchestrator {
   private frameRelay: FrameRelay | null = null;
 
   private scanCountdownTimer: ReturnType<typeof setInterval> | null = null;
+  private scanSfxTimer: ReturnType<typeof setInterval> | null = null;
 
   // Audio output: Gemini Live PCM16 → Mentra AudioOutputStream → glasses speaker.
   // Lazily created on first audio chunk; null between turns.
@@ -134,16 +136,20 @@ export class SessionOrchestrator {
     streamState.scanStatus = 'active';
     streamState.scanStartedAt = Date.now();
     this.startScanCountdown();
+    this.startScanSfxLoop();
     try {
       const card = await this.scanWithTimeout(this.frameRelay);
       this.stopScanCountdown();
+      this.stopScanSfxLoop();
       this.frameRelay.stop();
       streamState.scanStatus = 'idle';
       streamState.scanStartedAt = null;
       this.card = card;
+      playSfx(this.session, 'found');
       showText(this.session, 'QR found ✓', 2000);
     } catch (err) {
       this.stopScanCountdown();
+      this.stopScanSfxLoop();
       streamState.scanStatus = 'timeout';
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[Session] Scan timed out — awaiting manual rescan: ${msg}`);
@@ -184,6 +190,7 @@ export class SessionOrchestrator {
     }
     console.log('[Session] User stopped session — returning to scan mode');
     streamState.sessionEndReason = 'user_stop';
+    playSfx(this.session, 'session-end');
     // Transition first so handleDisconnect's state===SESSION guard no-ops
     // when gemini.disconnect() fires its onDisconnected callback below.
     this.transition(AppState.SCANNING);
@@ -229,6 +236,25 @@ export class SessionOrchestrator {
     if (this.scanCountdownTimer) {
       clearInterval(this.scanCountdownTimer);
       this.scanCountdownTimer = null;
+    }
+  }
+
+  /**
+   * Plays scanning.mp3 once at scan start, then every 2 seconds until the
+   * scan ends (success or timeout). Mirrors startScanCountdown's lifecycle.
+   */
+  private startScanSfxLoop(): void {
+    this.stopScanSfxLoop();
+    playSfx(this.session, 'scanning');
+    this.scanSfxTimer = setInterval(() => {
+      playSfx(this.session, 'scanning');
+    }, 2000);
+  }
+
+  private stopScanSfxLoop(): void {
+    if (this.scanSfxTimer) {
+      clearInterval(this.scanSfxTimer);
+      this.scanSfxTimer = null;
     }
   }
 
@@ -834,6 +860,7 @@ export class SessionOrchestrator {
     if (this.state === AppState.SESSION) {
       const r = reason ?? 'gemini_disconnect';
       streamState.sessionEndReason = r;
+      playSfx(this.session, 'session-end');
       // Auto-return to scan mode. User doesn't have to do anything — next
       // QR starts a fresh session. If they wanted to stop the whole thing
       // they'd close the app on the glasses.
@@ -857,6 +884,7 @@ export class SessionOrchestrator {
     this.transition(AppState.IDLE);
 
     safely('scanCountdown.stop',  () => this.stopScanCountdown());
+    safely('scanSfx.stop',        () => this.stopScanSfxLoop());
     safely('gemini.disconnect',   () => this.gemini.disconnect());
     safely('whep.stop',           () => this.whepClient.stop());
     safely('relay.stop',          () => this.frameRelay?.stop());

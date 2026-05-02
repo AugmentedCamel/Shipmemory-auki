@@ -26,4 +26,6 @@ export const env = {
    * their own edge host (or skip the rewrite entirely).
    */
   SHIP_EDGE_BASE_URL: process.env.SHIP_EDGE_BASE_URL ?? 'https://shipedge-production.up.railway.app',
+  /** Mentra client's own public URL — used to host SFX audio served back to the glasses. Optional; SFX is no-op when unset. */
+  MENTRA_PUBLIC_URL: process.env.MENTRA_PUBLIC_URL ?? null,
 } as const;

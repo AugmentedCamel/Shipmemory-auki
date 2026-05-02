@@ -1,8 +1,13 @@
 import { AppServer, AppSession } from '@mentra/sdk';
 import { streamSSE } from 'hono/streaming';
 import { EventEmitter } from 'node:events';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { env } from './config/env.js';
 import { SessionOrchestrator } from './app/session.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Transcript event bus for the webview SSE stream. Orchestrator pushes;
@@ -212,7 +217,22 @@ class ShipMemoryApp extends AppServer {
     // Webview page
     this.get('/webview', (c) => c.html(WEBVIEW_HTML));
 
-    console.log('[ShipMemory] Routes: /webview (stream), /frame (camera preview), /api/frame (raw JPEG)');
+    // SFX hosting — bundled MP3s served back to the glasses via session.audio.playAudio.
+    // Self-contained: no external host required.
+    this.get('/sfx/:name', (c) => {
+      const name = c.req.param('name');
+      if (!/^[a-z0-9-]+\.mp3$/i.test(name)) return c.text('not found', 404);
+      const file = path.join(__dirname, 'assets', 'sfx', name);
+      if (!fs.existsSync(file)) return c.text('not found', 404);
+      return new Response(new Uint8Array(fs.readFileSync(file)), {
+        headers: {
+          'Content-Type': 'audio/mpeg',
+          'Cache-Control': 'public, max-age=86400',
+        },
+      });
+    });
+
+    console.log('[ShipMemory] Routes: /webview (stream), /frame (camera preview), /api/frame (raw JPEG), /sfx/:name (bundled audio)');
   }
 
   protected async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
