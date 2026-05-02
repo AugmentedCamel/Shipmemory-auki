@@ -230,6 +230,10 @@
         </div>
         <button type="submit" class="w-full p-3 bg-blue-600 rounded font-medium hover:bg-blue-500">Connect</button>
         <p id="login-error" class="text-red-400 text-sm hidden"></p>
+        <div id="login-retry-wrap" class="hidden p-3 bg-amber-950/40 border border-amber-900 rounded text-xs text-amber-200">
+          <p class="mb-2">The bridge couldn't reach Auki to mint a domain token. Your API key looks fine — Auki may have been momentarily unreachable, or the cached token expired.</p>
+          <button type="button" id="login-retry-btn" class="px-3 py-1.5 bg-amber-600 rounded text-xs font-medium hover:bg-amber-500 text-white">Retry Auki login</button>
+        </div>
       </form>
       <p class="text-xs text-gray-500 mt-6">
         Lost your key? Unset it on the host (edit <code class="bg-gray-800 px-1 rounded">data/config.json</code> or the <code class="bg-gray-800 px-1 rounded">API_KEY</code> env var) and re-run setup.
@@ -376,7 +380,15 @@
       const url = API + path + sep + 'key=' + encodeURIComponent(apiKey);
       const headers = { 'Content-Type': 'application/json', ...opts.headers };
       const resp = await fetch(url, { ...opts, headers });
-      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || resp.statusText);
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        const base = body.error || resp.statusText;
+        const msg = body.detail ? base + ' — ' + body.detail : base;
+        const err = new Error(msg);
+        err.status = resp.status;
+        err.error = body.error;
+        throw err;
+      }
       return resp;
     }
 
@@ -500,10 +512,11 @@
     });
 
     // ==================== LOGIN ====================
-    document.getElementById('login-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
+    async function attemptLogin() {
       const errEl = document.getElementById('login-error');
+      const retryWrap = document.getElementById('login-retry-wrap');
       errEl.classList.add('hidden');
+      retryWrap.classList.add('hidden');
       apiKey = document.getElementById('api-key').value.trim();
       try {
         await apiFetch('/card');
@@ -513,6 +526,32 @@
       } catch (err) {
         errEl.textContent = err.message;
         errEl.classList.remove('hidden');
+        // 503 from requireConfigured = bridge couldn't auth to Auki. Offer a
+        // manual retry instead of forcing the user to reload or restart.
+        if (err.status === 503) retryWrap.classList.remove('hidden');
+      }
+    }
+
+    document.getElementById('login-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      attemptLogin();
+    });
+
+    document.getElementById('login-retry-btn').addEventListener('click', async () => {
+      const btn = document.getElementById('login-retry-btn');
+      const errEl = document.getElementById('login-error');
+      apiKey = document.getElementById('api-key').value.trim();
+      btn.disabled = true;
+      btn.textContent = 'Retrying...';
+      try {
+        await apiFetch('/api/setup/retry-auki-login', { method: 'POST' });
+        await attemptLogin();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Retry Auki login';
       }
     });
 

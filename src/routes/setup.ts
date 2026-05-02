@@ -112,6 +112,26 @@ setupRoutes.post('/api-key', setupAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/setup/retry-auki-login — forces a fresh Auki login using the
+ * stored credentials. Used by the UI when a user-facing request failed because
+ * the bridge's cached domain token was stale or Auki was momentarily
+ * unreachable. Requires the API key to be valid (setupAuth gates it).
+ */
+setupRoutes.post('/retry-auki-login', setupAuth, async (_req, res) => {
+  if (!BridgeConfig.current().isConfigured) {
+    res.status(409).json({ error: 'Bridge not configured', detail: 'Complete setup at /ui first' });
+    return;
+  }
+  try {
+    await BridgeAuth.relogin();
+    res.json({ ok: true });
+  } catch (err: any) {
+    const message = err?.response?.data?.error || err?.message || 'Auki login failed';
+    res.status(503).json({ error: 'Auki login failed', detail: message });
+  }
+});
+
 /** POST /api/setup/logout — clears Auki creds in config. API key is untouched. */
 setupRoutes.post('/logout', setupAuth, async (_req, res) => {
   try {

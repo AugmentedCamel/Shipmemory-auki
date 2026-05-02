@@ -56,6 +56,7 @@ export class BridgeAuth {
   private static domainId: string | null = null;
   private static refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private static mintPromise: Promise<DomainAuth> | null = null;
+  private static ensurePromise: Promise<void> | null = null;
   private static subscribed = false;
 
   /** Called once on boot. Subscribes to config changes. No-op if unconfigured. */
@@ -114,6 +115,38 @@ export class BridgeAuth {
     }
   }
 
+  /**
+   * Force a fresh login from stored credentials, discarding any cached state.
+   * Used by the "Retry Auki login" path when the user wants to recover from a
+   * transient upstream failure without restarting the bridge.
+   */
+  static async relogin(): Promise<void> {
+    this.reset();
+    await this.ensureReady();
+  }
+
+  /**
+   * Lazy-login hook for request paths. If auth isn't ready but creds are
+   * configured, re-run the login/mint flow. Dedupes concurrent callers so a
+   * burst of requests triggers one login, not N.
+   */
+  static async ensureReady(): Promise<void> {
+    if (this.isReady()) return;
+    const snapshot = BridgeConfig.current();
+    if (!snapshot.isConfigured) {
+      throw new Error('Bridge not configured');
+    }
+    if (this.ensurePromise) return this.ensurePromise;
+    this.ensurePromise = (async () => {
+      try {
+        await this.handleConfigChange();
+      } finally {
+        this.ensurePromise = null;
+      }
+    })();
+    return this.ensurePromise;
+  }
+
   /** (Re)mint the domain token. Deduplicates concurrent callers via mintPromise. */
   private static async refresh(): Promise<DomainAuth> {
     if (this.mintPromise) return this.mintPromise;
@@ -126,14 +159,37 @@ export class BridgeAuth {
 
     this.mintPromise = (async () => {
       try {
-        const auth = await AukiAuthService.mintDomainToken(sessionToken, domainId);
-        // If config changed under us mid-flight, discard and bail.
-        if (this.sessionToken !== sessionToken || this.domainId !== domainId) {
-          throw new Error('Config changed during refresh — discarding stale token');
+        let activeSession = sessionToken;
+        try {
+          const auth = await AukiAuthService.mintDomainToken(activeSession, domainId);
+          if (this.sessionToken !== sessionToken || this.domainId !== domainId) {
+            throw new Error('Config changed during refresh — discarding stale token');
+          }
+          this.domainAuth = auth;
+          this.scheduleRefresh(auth);
+          return auth;
+        } catch (err: any) {
+          // Session access_token likely expired — Auki returns 401/403. Re-login
+          // from stored creds and retry once before giving up.
+          const status = err?.response?.status;
+          if (status !== 401 && status !== 403) throw err;
+          const snapshot = BridgeConfig.current();
+          if (!snapshot.aukiEmail || !snapshot.aukiPassword) throw err;
+          console.log('[BridgeAuth] Session token rejected — re-logging in');
+          const { accessToken } = await AukiAuthService.login(snapshot.aukiEmail, snapshot.aukiPassword);
+          if (this.domainId !== domainId) {
+            throw new Error('Config changed during re-login — discarding stale token');
+          }
+          this.sessionToken = accessToken;
+          activeSession = accessToken;
+          const auth = await AukiAuthService.mintDomainToken(activeSession, domainId);
+          if (this.domainId !== domainId) {
+            throw new Error('Config changed during refresh — discarding stale token');
+          }
+          this.domainAuth = auth;
+          this.scheduleRefresh(auth);
+          return auth;
         }
-        this.domainAuth = auth;
-        this.scheduleRefresh(auth);
-        return auth;
       } finally {
         this.mintPromise = null;
       }
