@@ -256,6 +256,13 @@ export class SessionOrchestrator {
       clearInterval(this.scanSfxTimer);
       this.scanSfxTimer = null;
     }
+    // Cancel any scanning chime mid-playback on the glasses so the next SFX
+    // (found / session-end) isn't dropped by the SDK as a collision.
+    try {
+      this.session.audio.stopAudio();
+    } catch (err) {
+      console.warn('[SFX] stopAudio failed:', err);
+    }
   }
 
   /** Race provider.scan() against a timeout so we don't hang forever. */
