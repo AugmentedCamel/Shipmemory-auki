@@ -6,3 +6,17 @@ dist/
 logs.txt
 package-lock.json
 data/
+
+# Local-only docs and planning (keep README.md + CLAUDE.md tracked)
+DESIGN.md
+MENTRA_BUG_REPORT.md
+PLAN_MENTRA_CLIENT.md
+PROTOCOL.md
+TUTORIAL.md
+VIDEO_SCRIPT.md
+
+# Local-only assets / scratch
+*.pptx
+~$*
+*.log
+graphics/
