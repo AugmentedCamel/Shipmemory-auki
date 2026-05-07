@@ -214,6 +214,11 @@ export class BridgeAuth {
   /** Get a valid domain auth. Refreshes if the cached one is near expiry. */
   static async getDomainAuth(): Promise<{ auth: DomainAuth; domainId: string }> {
     if (!this.domainId || !this.sessionToken) {
+      // State was wiped (boot login failed, config change, etc). Try to recover
+      // by re-running the login flow from stored creds before giving up.
+      await this.ensureReady();
+    }
+    if (!this.domainId || !this.sessionToken) {
       throw new Error('Bridge auth not configured — complete setup at /ui');
     }
     if (this.domainAuth && (!this.domainAuth.exp || this.domainAuth.exp - Date.now() > 60_000)) {
