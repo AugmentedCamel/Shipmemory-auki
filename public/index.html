@@ -380,6 +380,16 @@
       return data;
     }
 
+    // For setup endpoints gated by setupAuth: open when the bridge is
+    // unconfigured, key-required once it's configured. Tack the in-memory key
+    // on when we have one so re-running setup from the login screen works.
+    async function setupFetch(path, opts = {}) {
+      const url = apiKey
+        ? path + (path.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey)
+        : path;
+      return fetchJson(url, opts);
+    }
+
     async function apiFetch(path, opts = {}) {
       const sep = path.includes('?') ? '&' : '?';
       const url = API + path + sep + 'key=' + encodeURIComponent(apiKey);
@@ -464,7 +474,7 @@
         if (!env.has('aukiEmail')) body.email = (document.getElementById('auki-email') || {}).value?.trim() || '';
         if (!env.has('aukiPassword')) body.password = (document.getElementById('auki-password') || {}).value || '';
         if (!env.has('aukiDomainId')) body.domainId = (document.getElementById('auki-domain-id') || {}).value?.trim() || '';
-        await fetchJson('/api/setup/auki-login', {
+        await setupFetch('/api/setup/auki-login', {
           method: 'POST',
           body: JSON.stringify(body),
         });
@@ -499,7 +509,7 @@
       btn.disabled = true;
       btn.textContent = 'Saving...';
       try {
-        await fetchJson('/api/setup/api-key', {
+        await setupFetch('/api/setup/api-key', {
           method: 'POST',
           body: JSON.stringify({ apiKey: newKey }),
         });
@@ -543,9 +553,25 @@
     });
 
     document.getElementById('login-to-setup-btn').addEventListener('click', async () => {
+      const errEl = document.getElementById('login-error');
       try {
         setupStatus = await fetchJson('/api/setup/status');
       } catch { /* keep last-known status */ }
+
+      // If the bridge is already configured, /api/setup writes are gated by
+      // the API key. Pull whatever the user typed into the login form so the
+      // wizard can authenticate its writes. Without it, every step would 401.
+      if (setupStatus && setupStatus.configured) {
+        const typed = (document.getElementById('api-key').value || '').trim();
+        if (!typed) {
+          errEl.textContent = 'Enter your bridge API key first — re-running setup on a configured bridge needs it to authenticate.';
+          errEl.classList.remove('hidden');
+          return;
+        }
+        apiKey = typed;
+      }
+
+      errEl.classList.add('hidden');
       gotoStep(1);
       showView('setup');
     });
