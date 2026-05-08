@@ -235,9 +235,14 @@
           <button type="button" id="login-retry-btn" class="px-3 py-1.5 bg-amber-600 rounded text-xs font-medium hover:bg-amber-500 text-white">Retry Auki login</button>
         </div>
       </form>
-      <p class="text-xs text-gray-500 mt-6">
-        Lost your key? Unset it on the host (edit <code class="bg-gray-800 px-1 rounded">data/config.json</code> or the <code class="bg-gray-800 px-1 rounded">API_KEY</code> env var) and re-run setup.
-      </p>
+      <div class="mt-6 pt-4 border-t border-gray-800">
+        <button type="button" id="login-to-setup-btn" class="w-full p-2 bg-gray-800 hover:bg-gray-700 rounded text-sm text-gray-300 border border-gray-700">
+          Re-run setup wizard
+        </button>
+        <p class="text-xs text-gray-500 mt-3">
+          Lost your key? Unset it on the host (edit <code class="bg-gray-800 px-1 rounded">data/config.json</code> or the <code class="bg-gray-800 px-1 rounded">API_KEY</code> env var) and re-run setup.
+        </p>
+      </div>
     </div>
 
     <!-- =========================== DASHBOARD =========================== -->
@@ -535,6 +540,14 @@
     document.getElementById('login-form').addEventListener('submit', (e) => {
       e.preventDefault();
       attemptLogin();
+    });
+
+    document.getElementById('login-to-setup-btn').addEventListener('click', async () => {
+      try {
+        setupStatus = await fetchJson('/api/setup/status');
+      } catch { /* keep last-known status */ }
+      gotoStep(1);
+      showView('setup');
     });
 
     document.getElementById('login-retry-btn').addEventListener('click', async () => {
